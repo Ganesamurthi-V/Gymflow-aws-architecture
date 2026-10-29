@@ -1,0 +1,786 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { ArrowLeft, Check, AlertTriangle, Search, Loader2, MapPin, Trash2 } from "lucide-react";
+import { format, parseISO } from "date-fns";
+import { monthsForPlan, parseStartDate, resolveImportedMembership } from "@/lib/import/membershipDates";
+import { todayIST } from "@/lib/utils";
+import { clearImportStorage } from "@/lib/import/storage";
+import { importErrorMessage, messageForApiError, readImportResponse } from "@/lib/import/api-errors";
+import type { ImportedRow } from "../page";
+import WizardHeader from "@/components/import/WizardHeader";
+import PlanNotice from "@/components/subscription/PlanNotice";
+import { api } from "@/lib/api/client";
+
+type Step = "edit" | "preview" | "done";
+interface DoneResult { success: number; skipped: number; planSkipped: number }
+
+const EDIT_FIELDS: (keyof ImportedRow)[] = [
+  "member_number", "name", "phone", "plan", "category", "start_date",
+  "amount", "payment_mode", "gender", "age", "area",
+];
+
+export default function ImportEditPage() {
+  const router = useRouter();
+
+  const [rows, setRows] = useState<ImportedRow[]>([]);
+  const [originalRows, setOriginalRows] = useState<ImportedRow[]>([]);
+  const [dbNums, setDbNums] = useState<Set<number>>(new Set());
+  const [hasIdCol, setHasIdCol] = useState(false);
+  // Read in an effect, not during render: sessionStorage does not exist on the
+  // server, so reading it inline made the first client render differ from the
+  // server HTML and React threw a hydration error on every reload of this page.
+  const [hasReviewState, setHasReviewState] = useState(false);
+  const [step, setStep] = useState<Step>("edit");
+  const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  // Owner has accepted that rows without a start date get a full plan from today.
+  const [startAck, setStartAck] = useState(false);
+  const today = todayIST();
+  const [error, setError] = useState("");
+  // Set when the server says the plan's member cap is reached, so the upgrade notice replaces the generic error.
+  const [planLimit, setPlanLimit] = useState(false);
+  // How many rows this gym's plan still has room for (null = no cap). Informational: it stays
+  // null while loading or on error, and /api/import/confirm enforces the same cap.
+  const [importCap, setImportCap] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.get<{ data?: { maxRows?: number | null } }>("/api/import/limits")
+      .then(res => {
+        const m = res?.data?.maxRows;
+        if (!cancelled && typeof m === "number") setImportCap(m);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const [doneResult, setDoneResult] = useState<DoneResult>({ success: 0, skipped: 0, planSkipped: 0 });
+  const [activeAreaIdx, setActiveAreaIdx] = useState<number | null>(null);
+  const [areaSuggestions, setAreaSuggestions] = useState<Record<number, Array<{ id: string; name: string; district: string }>>>({});
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const blurTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+  const searchTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const mirrorRef = useRef<HTMLDivElement>(null);
+  const tableInnerRef = useRef<HTMLDivElement>(null);
+  const previewScrollRef = useRef<HTMLDivElement>(null);
+
+  // Track sidebar collapsed state for the fixed scrollbar left offset
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  useEffect(() => {
+    setSidebarCollapsed(localStorage.getItem('gymflow_sidebar_collapsed') === 'true');
+    // Listen for storage changes (sidebar toggle)
+    const onStorage = () => setSidebarCollapsed(localStorage.getItem('gymflow_sidebar_collapsed') === 'true');
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  // Wheel isolation for all data-scroll-box elements
+  // Uses non-passive listener ONLY on the specific scroll boxes, not document-wide
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      const box = (e.target as HTMLElement).closest('[data-scroll-box]') as HTMLElement | null;
+      if (!box) return;
+      const { scrollTop, scrollHeight, clientHeight } = box;
+      // Only prevent default when the box can actually scroll further
+      const canScrollDown = e.deltaY > 0 && scrollTop + clientHeight < scrollHeight - 1;
+      const canScrollUp   = e.deltaY < 0 && scrollTop > 0;
+      if (canScrollDown || canScrollUp) e.preventDefault();
+    };
+    document.addEventListener('wheel', onWheel, { passive: false });
+    return () => document.removeEventListener('wheel', onWheel);
+  }, []);
+
+  useEffect(() => {
+    const stored = sessionStorage.getItem("import_rows");
+    if (!stored) { router.push("/owner/import"); return; }
+    const parsed: ImportedRow[] = JSON.parse(stored);
+    setRows(parsed);
+    const origStored = sessionStorage.getItem("import_rows_original");
+    setOriginalRows(origStored ? JSON.parse(origStored) : parsed.map(r => ({ ...r })));
+    setHasIdCol(sessionStorage.getItem("import_has_id_col") === "1");
+    setHasReviewState(!!sessionStorage.getItem("import_review_state"));
+    // Load DB nums for live uniqueness validation, but ONLY for numbers present
+    // in the file. Served by /api/import/next-member-id, which resolves the gym
+    // from the session and returns which of the requested numbers already exist.
+    // Previously this queried `gyms` and `members` directly from the browser.
+    async function loadDbNums() {
+      const fileNums = parsed.map(r => parseInt(r.member_number)).filter(n => !isNaN(n));
+      if (fileNums.length === 0) return;
+
+      try {
+        const res = await fetch(
+          `/api/import/next-member-id?${new URLSearchParams({ requested: fileNums.join(',') })}`
+        );
+        if (!res.ok) return;
+        const json = await res.json() as { conflicts?: number[] };
+        setDbNums(new Set(json.conflicts ?? []));
+      } catch {
+        // Best-effort: without this set the UI simply shows no duplicate
+        // warnings; the server still re-assigns IDs safely on save.
+      }
+    }
+    loadDbNums();
+  }, []);
+
+  // Sync rows to sessionStorage on every edit so navigating steps never loses data
+  useEffect(() => {
+    if (rows.length > 0 && step !== "done") {
+      sessionStorage.setItem("import_rows", JSON.stringify(rows));
+    }
+  }, [rows, step]);
+
+  // Sync mirror scrollbar width to table inner width
+  useEffect(() => {
+    if (tableInnerRef.current && mirrorRef.current) {
+      mirrorRef.current.firstElementChild && ((mirrorRef.current.firstElementChild as HTMLElement).style.width = tableInnerRef.current.scrollWidth + 'px');
+    }
+  }, [rows]);
+
+  // Keep mirror and table scroll in sync
+  useEffect(() => {
+    const table = scrollRef.current;
+    const mirror = mirrorRef.current;
+    if (!table || !mirror) return;
+    let fromTable = false, fromMirror = false;
+    const onTable = () => { if (fromMirror) { fromMirror = false; return; } fromTable = true; mirror.scrollLeft = table.scrollLeft; };
+    const onMirror = () => { if (fromTable) { fromTable = false; return; } fromMirror = true; table.scrollLeft = mirror.scrollLeft; };
+    table.addEventListener('scroll', onTable);
+    mirror.addEventListener('scroll', onMirror);
+
+    // Block wheel on the mirror bar — only drag should move it, not wheel
+    const blockWheel = (e: WheelEvent) => e.preventDefault();
+    mirror.addEventListener('wheel', blockWheel, { passive: false });
+
+    return () => {
+      table.removeEventListener('scroll', onTable);
+      mirror.removeEventListener('scroll', onMirror);
+      mirror.removeEventListener('wheel', blockWheel);
+    };
+  }, [rows]);
+  // NOTE: No horizontal wheel-to-scroll on the table — that caused lag.
+  // The table scrolls horizontally via the mirror scrollbar (drag only).
+
+  function deleteSelected() {
+    setRows(prev => {
+      const remaining = prev.filter((_, i) => !selected.has(i));
+      if (hasIdCol) return remaining; // file had IDs — don't touch them
+      const usedNums = new Set(
+        remaining.filter(r => !r._id_auto).map(r => parseInt(r.member_number)).filter(Boolean)
+      );
+      const dbAndUsed = new Set([...Array.from(dbNums), ...Array.from(usedNums)]);
+      let next = 1;
+      function nextAvail() {
+        while (dbAndUsed.has(next)) next++;
+        const n = next++;
+        dbAndUsed.add(n);
+        return String(n);
+      }
+      return remaining.map(r =>
+        r._id_auto ? { ...r, member_number: nextAvail() } : r
+      );
+    });
+    setOriginalRows(prev => prev.filter((_, i) => !selected.has(i)));
+    setSelected(new Set());
+  }
+
+  function toggleSelect(idx: number) {
+    setSelected(prev => { const s = new Set(prev); s.has(idx) ? s.delete(idx) : s.add(idx); return s; });
+  }
+
+  function toggleSelectAll() {
+    const visibleIdxs = filtered.map(r => r._idx);
+    const allSelected = visibleIdxs.every(i => selected.has(i));
+    setSelected(prev => {
+      const s = new Set(prev);
+      allSelected ? visibleIdxs.forEach(i => s.delete(i)) : visibleIdxs.forEach(i => s.add(i));
+      return s;
+    });
+  }
+
+  function updateRow(idx: number, field: keyof ImportedRow, value: string) {
+    setRows(prev => prev.map((r, i) => {
+      if (i !== idx) return r;
+      const next: ImportedRow = { ...r, [field]: value, _status: undefined, _error: undefined };
+      // A new plan label means its standard length, not the length the sheet stated for the old one.
+      if (field === "plan") { next.duration_months = undefined; next.plan_name = undefined; }
+      if (field === "start_date") {
+        next._start_defaulted = false;
+        const parsed = parseStartDate(value, today);
+        next._start_invalid = !parsed.ok;
+        if (!parsed.ok) { next._status = "error"; next._error = parsed.message; }
+      }
+      return next;
+    }));
+  }
+
+  function membershipOf(row: ImportedRow) {
+    const parsed = parseStartDate(row.start_date, today);
+    if (!parsed.ok) return null;
+    return resolveImportedMembership({ startDate: parsed.date, durationMonths: monthsForPlan(row.plan, row.duration_months), today });
+  }
+
+  function validateId(idx: number, value: string) {
+    const num = parseInt(value);
+    if (!value || isNaN(num)) {
+      setRows(prev => prev.map((r, i) => i === idx ? { ...r, _id_conflict: false, _id_missing: true } : r));
+      return;
+    }
+    const inDB = dbNums.has(num);
+    const inFile = rows.some((r, i) => i !== idx && r._status !== "error" && r._status !== "duplicate" && parseInt(r.member_number) === num);
+    setRows(prev => prev.map((r, i) => i === idx ? { ...r, _id_conflict: inDB || inFile, _id_missing: false } : r));
+  }
+
+  const handleAreaSearch = useCallback((_idx: number, _query: string) => {
+    // Area suggestions removed — plain text input only
+  }, []);
+
+  function isRowChanged(row: ImportedRow): boolean {
+    const orig = originalRows.find(r => r._rowId === row._rowId);
+    if (!orig) return false;
+    return EDIT_FIELDS.some(f => row[f] !== orig[f]);
+  }
+
+  function isCellChanged(row: ImportedRow, field: keyof ImportedRow): boolean {
+    const orig = originalRows.find(r => r._rowId === row._rowId);
+    if (!orig) return false;
+    return row[field] !== orig[field];
+  }
+
+  const validRows = rows.filter(r => r._status !== "error" && r._status !== "duplicate");
+  const skippedRows = rows.filter(r => r._status === "error" || r._status === "duplicate");
+  // Valid rows past the plan cap are hidden and never sent, so the preview shows exactly what will
+  // be imported. Derived from row order, so deleting a row pulls the next one back in.
+  const overCapIdx = new Set<number>();
+  if (importCap !== null) {
+    let seen = 0;
+    rows.forEach((r, i) => {
+      if (r._status === "error" || r._status === "duplicate") return;
+      if (seen >= importCap) overCapIdx.add(i);
+      seen++;
+    });
+  }
+  const importRows = rows.filter((r, i) => !overCapIdx.has(i) && r._status !== "error" && r._status !== "duplicate");
+  const noStartCount = importRows.filter(r => r._start_defaulted).length;
+  const expiredCount = importRows.filter(r => membershipOf(r)?.status === "expired").length;
+  const editedCount = rows.reduce((count, row) => count + (isRowChanged(row) ? 1 : 0), 0);
+
+  const anyOriginallySkipped = originalRows.some(o => o._status === "error" || o._status === "duplicate");
+
+  const filtered = rows.map((r, i) => ({ ...r, _idx: i })).filter(r => {
+    if (overCapIdx.has(r._idx)) return false;
+    if (anyOriginallySkipped) {
+      const orig = originalRows.find(o => o._rowId === r._rowId);
+      const originallySkipped = orig && (orig._status === "error" || orig._status === "duplicate");
+      if (!originallySkipped) return false;
+    }
+    
+    return r.name.toLowerCase().includes(search.toLowerCase()) ||
+           r.phone.includes(search) ||
+           r.member_number.includes(search);
+  });
+
+  const hi = (row: ImportedRow, field: keyof ImportedRow) =>
+    isCellChanged(row, field)
+      ? "bg-emerald-100 text-emerald-800 font-semibold px-1.5 py-0.5 rounded"
+      : "";
+
+  const conflictCount = rows.filter((r, i) => r._id_conflict && !overCapIdx.has(i)).length;
+  const missingIdCount = importRows.filter(r => !r.member_number || !parseInt(r.member_number)).length;
+
+  function goBackToReview() {
+    // Persist current edits so they survive the round-trip
+    sessionStorage.setItem("import_rows", JSON.stringify(rows));
+    router.push("/owner/import/review");
+  }
+
+  function handlePreview() {
+    if (noStartCount > 0 && !startAck) { setError("Confirm the start date notice below before importing"); return; }
+    if (missingIdCount > 0) { setError(`${missingIdCount} member${missingIdCount !== 1 ? 's are' : ' is'} missing a Member ID — fix them before importing`); return; }
+    if (conflictCount > 0) { setError(`${conflictCount} member${conflictCount !== 1 ? 's have' : ' has'} a conflicting Member ID — fix them before importing`); return; }
+    setError("");
+    setConfirmed(true);
+    handleSave();
+  }
+
+  async function handleSave() {
+    setLoading(true);
+    setError("");
+    setPlanLimit(false);
+
+    try {
+      const toInsert = importRows;
+      const skipped = skippedRows.length;
+
+      // ── Insert members AND their memberships via the server route ──────────
+      // The route resolves the gym from the session, re-assigns member numbers
+      // above the current MAX to guarantee no constraint violation, and creates
+      // the matching memberships in the same request. The browser previously did
+      // the membership insert itself with a client-supplied gym_id.
+      const res = await fetch("/api/import/confirm", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+        body: JSON.stringify({ rows: toInsert }),
+      });
+
+      // Not res.json(): a timeout or size limit upstream of our route answers with an
+      // HTML page, and parsing that threw a raw JSON syntax error into the banner.
+      const result = await readImportResponse<{
+        success?: boolean;
+        error?: { code?: string; message?: string };
+        data?: { member_ids?: string[]; imported?: number; skipped?: number };
+      }>(res);
+      if (!res.ok || !result.success) {
+        if (result.error?.code === "PLAN_MEMBER_LIMIT") setPlanLimit(true);
+        throw new Error(messageForApiError(result.error));
+      }
+
+      // The server returns the inserted member IDs in the same order as the rows
+      // we sent, so downstream steps can zip them back together. This is robust
+      // against normalized (E.164 / INVALID_NUMBER) and duplicate phone numbers,
+      // which the old "re-query members by phone" approach could not distinguish.
+      const memberIds: string[] = result.data?.member_ids ?? [];
+      // On a plan cap the server keeps only the first `imported` rows, so ids align with
+      // toInsert.slice(0, imported). Comparing to toInsert.length showed a false error.
+      const imported = typeof result.data?.imported === "number" ? result.data.imported : toInsert.length;
+      const planSkipped = (result.data?.skipped ?? 0) + overCapIdx.size;
+      if (memberIds.length !== imported) {
+        throw new Error("The import finished, but we could not confirm every member was added. Please check the Members page before trying again.");
+      }
+
+      // ── Immediately fire expiry/expired reminders for the imported batch ───
+      // Fire-and-forget: the "Import Complete" screen must not wait on sends.
+      // The daily cron is the backstop. Welcome messages are never sent here.
+      void fetch("/api/whatsapp/automation/import-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memberIds }),
+      }).catch(() => {});
+
+      // Clear EVERY wizard key, not just the two row copies. The previous code
+      // left `import_review_state` behind — a full third copy of every imported
+      // member's name, phone, age and DOB, readable for the rest of the session.
+      clearImportStorage();
+
+      // The server already dropped its Redis keys, but the browser's Router Cache
+      // holds the Members / Payments / Dashboard payloads for up to 180s
+      // (next.config.mjs staleTimes). Without this the owner lands on those pages
+      // straight after the import and still sees the pre-import zeros.
+      // router.refresh() discards the whole client cache, not just this route.
+      router.refresh();
+
+      setDoneResult({ success: imported, skipped, planSkipped });
+      setStep("done");
+    } catch (err: any) {
+      setError(err instanceof Error && !(err instanceof TypeError) ? err.message : importErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (step === "done") {
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center px-4">
+        <div className="card p-10 text-center animate-pop-in max-w-md w-full border border-slate-100 shadow-2xl rounded-3xl bg-surface/80 backdrop-blur-md">
+          <div className="w-20 h-20 bg-emerald-50 border-2 border-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-xl shadow-emerald-500/10">
+            <Check className="w-10 h-10 text-emerald-600 stroke-[3]" />
+          </div>
+          <h2 className="text-2xl font-black text-slate-900 tracking-tight mb-2">Import Complete! 🎉</h2>
+          <p className="text-slate-500 text-sm font-semibold leading-relaxed">
+            <span className="text-emerald-600 font-extrabold text-xl">{doneResult.success}</span>
+            <span className="text-slate-600"> members imported successfully</span>
+            {doneResult.skipped > 0 && (
+              <><br /><span className="text-rose-500 font-bold text-xs mt-1 inline-block">{doneResult.skipped} rows skipped due to errors</span></>
+            )}
+          </p>
+          {doneResult.planSkipped > 0 && (
+            <div className="mt-4 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+              <p>{doneResult.planSkipped} rows were not imported because of your plan limit</p>
+              <Link href="/owner/subscription" className="inline-block mt-1 font-bold text-brand-600 underline">
+                Upgrade to a paid plan
+              </Link>
+            </div>
+          )}
+          <div className="mt-6 mx-auto w-56 h-2 bg-emerald-100/50 rounded-full overflow-hidden border border-emerald-100">
+            <div className="h-full bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-full animate-fill-bar" />
+          </div>
+          <div className="mt-8">
+            <Link href="/owner/members" className="btn-primary inline-flex items-center justify-center gap-2 px-8 py-3.5 shadow-lg shadow-brand-500/20 hover:shadow-brand-500/30">
+              View Members →
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Removed read-only preview step to combine Edit & Preview
+
+  // ── Edit ──────────────────────────────────────────────────────────────────
+  const cls = "px-2 py-1 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-brand-400 bg-surface disabled:bg-slate-50 disabled:text-slate-400";
+
+  return (
+    <div className="space-y-4 pb-6 max-w-[1600px] mx-auto">
+      <WizardHeader currentStep={5} />
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          {hasReviewState ? (
+            <button onClick={goBackToReview} className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-900 transition-colors">
+              <ArrowLeft className="w-4 h-4" />Review Areas
+            </button>
+          ) : (
+            <Link href="/owner/import" className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-900 transition-colors">
+              <ArrowLeft className="w-4 h-4" />Import
+            </Link>
+          )}
+          <span className="text-slate-300">/</span>
+          <h1 className="text-xl font-bold text-slate-900">Preview</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          {selected.size > 0 && (
+            <button onClick={deleteSelected}
+              className="flex items-center gap-1.5 px-3 py-2 bg-red-50 text-red-600 text-sm font-semibold rounded-lg border border-red-200 hover:bg-red-100 transition-all"
+            >
+              <Trash2 className="w-4 h-4" />
+              Delete {selected.size}
+            </button>
+          )}
+          {editedCount > 0 && (
+            <span className="text-xs font-semibold text-brand-600 bg-brand-50 px-2.5 py-1 rounded-full border border-brand-200">
+              {editedCount} edited
+            </span>
+          )}
+          <button onClick={() => { setConfirmed(true); handleSave(); }} disabled={conflictCount > 0 || missingIdCount > 0 || (noStartCount > 0 && !startAck) || loading}
+            className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-brand-500 to-brand-600 text-white text-sm font-semibold rounded-lg shadow-sm hover:from-brand-600 hover:to-brand-700 transition-all disabled:opacity-40"
+          >
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+            {loading ? 'Importing...' : 'Import Now'}
+          </button>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3 text-sm text-slate-500">
+        <span className="text-emerald-600 font-semibold">{importRows.length} valid</span>
+        <span>·</span>
+        <span className="text-red-500 font-semibold">{skippedRows.length} will be skipped</span>
+        {expiredCount > 0 && (<><span>·</span><span className="text-amber-600 font-semibold">{expiredCount} already expired</span></>)}
+      </div>
+
+      {noStartCount > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 space-y-2">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+            <p className="text-sm font-semibold text-amber-800">
+              Your file has no start date column, so every member gets a full plan starting today. Members who joined earlier will show more days than they really have. Add a Start Date column to your file, or set the date on each row below.
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-sm font-semibold text-amber-900 cursor-pointer">
+            <input type="checkbox" checked={startAck} onChange={e => setStartAck(e.target.checked)} className="w-4 h-4 rounded accent-brand-500" />
+            Import anyway, start every plan today
+          </label>
+        </div>
+      )}
+
+      {overCapIdx.size > 0 && (
+        <PlanNotice
+          tone="warning"
+          message={`Your plan allows 50 members in total, so only the first ${importRows.length} rows are shown and will be imported. ${overCapIdx.size} more rows are left out.`}
+          action={{ href: "/owner/subscription", label: "Upgrade to a paid plan" }}
+        />
+      )}
+
+      {planLimit && error && (
+        <PlanNotice tone="warning" message={error} action={{ href: "/owner/subscription", label: "Upgrade to a paid plan" }} />
+      )}
+
+      {(conflictCount > 0 || missingIdCount > 0 || (error && !planLimit)) && (
+        <div className="flex items-center gap-3 bg-red-50 border border-red-200 rounded-xl px-4 py-3">
+          <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0" />
+          <p className="text-sm font-semibold text-red-700">
+            {missingIdCount > 0 && `${missingIdCount} member${missingIdCount !== 1 ? 's are' : ' is'} missing a Member ID`}
+            {missingIdCount > 0 && conflictCount > 0 && " · "}
+            {conflictCount > 0 && `${conflictCount} Member ID${conflictCount !== 1 ? 's are' : ' is'} already taken`}
+            {(missingIdCount > 0 || conflictCount > 0) ? " — fix before importing" : error}
+          </p>
+        </div>
+      )}
+
+      {/* Areas needing review banner */}
+      {(() => {
+        const needsReview = rows.filter(r => r.area && (r._area_confidence ?? 1) < 0.90);
+        if (needsReview.length === 0) return null;
+        return (
+          <div className="flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+            <MapPin className="w-4 h-4 text-amber-500 flex-shrink-0" />
+            <p className="text-sm font-semibold text-amber-800">
+              {needsReview.length} area{needsReview.length !== 1 ? 's' : ''} need review — check the dots in the Area column
+            </p>
+            <div className="flex items-center gap-2 ml-auto text-xs text-amber-700">
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />Suggested</span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-400 inline-block" />Unresolved</span>
+            </div>
+          </div>
+        );
+      })()}
+
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="relative flex-1 min-w-[200px] sm:max-w-sm">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+          <input type="search" placeholder={anyOriginallySkipped ? "Search skipped members..." : "Search members..."} value={search}
+            onChange={e => setSearch(e.target.value)} className="input-field pl-9" />
+        </div>
+      </div>
+
+      <div
+        ref={mirrorRef}
+        className={`fixed bottom-0 z-30 overflow-x-auto overflow-y-hidden h-3 bg-surface/90 backdrop-blur-sm border-t border-slate-200 left-0 right-0 ${sidebarCollapsed ? 'md:left-14' : 'md:left-60'}`}
+      >
+        <div style={{ height: 1 }} />
+      </div>
+
+      <div className="card overflow-hidden w-full max-w-full">
+        <div ref={scrollRef} className="overflow-x-auto pb-48">
+          <div ref={tableInnerRef} className="min-w-full w-max">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-slate-100 bg-slate-50">
+                <th className="px-3 py-3 w-8">
+                  <input type="checkbox"
+                    checked={filtered.length > 0 && filtered.every(r => selected.has(r._idx))}
+                    onChange={toggleSelectAll}
+                    className="w-3.5 h-3.5 rounded accent-red-500 cursor-pointer"
+                  />
+                </th>
+                <th className="px-3 py-3 w-8"></th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide w-20">ID</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Name</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Phone</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Plan</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Category</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Start Date</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Ends / Days left</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Amount</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Mode</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Gender</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide w-16">Age</th>
+                <th className="text-left px-3 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide" style={{ minWidth: '180px', maxWidth: '220px', width: '200px' }}>Area ✦</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-50">
+              {filtered.map(row => {
+                const idx = row._idx;
+                const isSkipped = row._status === "error" || row._status === "duplicate";
+                const changed = isRowChanged(row);
+                const suggestions = areaSuggestions[idx] ?? [];
+
+                return (
+                  <tr key={idx} className={isSkipped ? "bg-red-50 opacity-60" : selected.has(idx) ? "bg-red-50/60" : changed ? "bg-brand-50/20" : "hover:bg-slate-50"}>
+                    <td className="px-3 py-2">
+                      <input type="checkbox"
+                        checked={selected.has(idx)}
+                        onChange={() => toggleSelect(idx)}
+                        className="w-3.5 h-3.5 rounded accent-red-500 cursor-pointer"
+                      />
+                    </td>
+                    <td className="px-3 py-2">
+                      {isSkipped ? <AlertTriangle className="w-4 h-4 text-red-400" />
+                        : (row._id_conflict || row._id_missing) ? <AlertTriangle className="w-4 h-4 text-amber-400" />
+                        : <Check className="w-4 h-4 text-emerald-500" />}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-col gap-0.5">
+                        <input
+                          type="text"
+                          value={row.member_number ? `GF${row.member_number.padStart(4, '0')}` : ''}
+                          onChange={e => {
+                            // Accept "GF0001" or plain "1" — strip prefix and store integer string
+                            const raw = e.target.value.trim().toUpperCase();
+                            const digits = raw.startsWith('GF') ? raw.slice(2) : raw;
+                            const num = parseInt(digits, 10);
+                            updateRow(idx, "member_number", isNaN(num) ? '' : String(num));
+                          }}
+                          onBlur={e => {
+                            const raw = e.target.value.trim().toUpperCase();
+                            const digits = raw.startsWith('GF') ? raw.slice(2) : raw;
+                            validateId(idx, digits);
+                          }}
+                          placeholder="GF0001"
+                          className={`w-20 ${cls} ${
+                            (row._id_conflict || row._id_missing) ? 'border-red-400 bg-red-50 text-red-700' : ''
+                          }`}
+                        />
+                        {row._id_auto && !row._id_conflict && (
+                          <span className="text-[9px] text-amber-500 font-semibold leading-none" title="No ID in file — auto-assigned. You can change it.">auto</span>
+                        )}
+                        {row._id_conflict && (
+                          <span className="text-[9px] text-red-500 font-semibold leading-none">taken!</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <input type="text" value={row.name}
+                        onChange={e => updateRow(idx, "name", e.target.value)}
+                        className={`w-36 ${cls}`} />
+                      {row._error && <p className="text-[10px] text-amber-600 mt-0.5">{row._error}</p>}
+                      {!isSkipped && row.phone && row.phone.length !== 10 && (
+                        <p className="text-[9px] text-amber-600 font-semibold mt-0.5 leading-tight">⚠ WhatsApp won't work</p>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <input type="tel" value={row.phone} maxLength={10}
+                        onChange={e => updateRow(idx, "phone", e.target.value)}
+                        className={`w-28 ${cls}`} />
+                    </td>
+                    <td className="px-3 py-2">
+                      <select value={row.plan}
+                        onChange={e => updateRow(idx, "plan", e.target.value)}
+                        className={cls}>
+                        <option value="monthly">Monthly</option>
+                        <option value="quarterly">Quarterly</option>
+                        <option value="annual">Annual</option>
+                      </select>
+                      {row.plan_name && (
+                        <p className="text-[10px] font-bold text-brand-600 mt-0.5 truncate max-w-[9rem]" title={row.plan_name}>{row.plan_name}</p>
+                      )}
+                      {row.duration_months !== undefined && (
+                        <p className="text-[10px] text-slate-500 mt-0.5">{Number.isInteger(row.duration_months) ? `${row.duration_months} months` : `${Math.round(row.duration_months * 30)} days`}</p>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <select value={row.category || 'both'} disabled={!!row.plan_name}
+                        onChange={e => updateRow(idx, "category", e.target.value)}
+                        className={cls}>
+                        <option value="both">Strength + Cardio</option>
+                        <option value="strength">Strength</option>
+                        <option value="cardio">Cardio</option>
+                      </select>
+                    </td>
+                    <td className="px-3 py-2">
+                      <input type="date" value={row.start_date}
+                        onChange={e => updateRow(idx, "start_date", e.target.value)}
+                        className={`w-36 ${cls} ${row._start_invalid ? 'border-red-400 bg-red-50' : ''}`} />
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {(() => {
+                        const m = membershipOf(row);
+                        if (!m) return <span className="text-xs font-semibold text-red-500">Fix start date</span>;
+                        return (
+                          <div className="text-xs leading-tight">
+                            <p className="text-slate-700 font-semibold">{format(parseISO(m.endDate), "dd MMM yyyy")}</p>
+                            <p className={m.status === "expired" ? "text-red-500 font-semibold" : m.status === "expiring" ? "text-amber-600 font-semibold" : "text-emerald-600 font-semibold"}>
+                              {m.status === "expired" ? "Expired" : m.daysLeft === 0 ? "Ends today" : `${m.daysLeft} days left`}
+                              {m.startsInFuture ? " (starts later)" : ""}
+                            </p>
+                          </div>
+                        );
+                      })()}
+                    </td>
+                    <td className="px-3 py-2">
+                      <input type="number" value={row.amount}
+                        onChange={e => updateRow(idx, "amount", e.target.value)}
+                        className={`w-20 ${cls}`} />
+                    </td>
+                    <td className="px-3 py-2">
+                      <select value={row.payment_mode}
+                        onChange={e => updateRow(idx, "payment_mode", e.target.value)}
+                        className={cls}>
+                        <option value="cash">Cash</option>
+                        <option value="upi">UPI</option>
+                        <option value="card">Card</option>
+                      </select>
+                    </td>
+                    <td className="px-3 py-2">
+                      <select value={row.gender}
+                        onChange={e => updateRow(idx, "gender", e.target.value)}
+                        className={cls}>
+                        <option value="">—</option>
+                        <option value="male">Male</option>
+                        <option value="female">Female</option>
+                        <option value="other">Other</option>
+                      </select>
+                    </td>
+                    <td className="px-3 py-2">
+                      <input type="number" value={row.age} min="1" max="120"
+                        onChange={e => updateRow(idx, "age", e.target.value)}
+                        className={`w-14 ${cls}`} placeholder="—" />
+                    </td>
+                    <td className="px-3 py-2 relative" style={{ minWidth: '180px', maxWidth: '220px', width: '200px' }}>
+                      <div className="flex items-center gap-1.5 w-full overflow-hidden">
+                        {row.area && !isSkipped && (
+                          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                            (row._area_confidence ?? 1) >= 0.90 ? 'bg-emerald-500' :
+                            (row._area_confidence ?? 1) >= 0.70 ? 'bg-amber-400' : 'bg-red-400'
+                          }`} title={`${((row._area_confidence ?? 1) * 100).toFixed(0)}% confidence (${row._area_matched_by ?? 'unknown'})`} />
+                        )}
+                        <input type="text" value={row.area}
+                          onChange={e => {
+                            updateRow(idx, "area", e.target.value);
+                            setActiveAreaIdx(idx);
+                            handleAreaSearch(idx, e.target.value);
+                          }}
+                          onFocus={() => { clearTimeout(blurTimers.current[idx]); setActiveAreaIdx(idx); }}
+                          onBlur={() => { blurTimers.current[idx] = setTimeout(() => setActiveAreaIdx(null), 150); }}
+                          className={`flex-1 min-w-0 ${cls}`} placeholder="Area" autoComplete="off" />
+                      </div>
+                      {activeAreaIdx === idx && suggestions.length > 0 && (
+                        <ul className="absolute z-30 left-3 right-3 bg-surface border border-slate-200 rounded-xl shadow-xl max-h-36 overflow-y-auto mt-0.5" data-scroll-box>
+                          {suggestions.slice(0, 5).map(a => (
+                            <li key={a.id}
+                              onMouseDown={() => {
+                                updateRow(idx, "area", a.name);
+                                updateRow(idx, "_area_confidence" as any, "1");
+                                setActiveAreaIdx(null);
+                              }}
+                              className="px-3 py-1.5 text-xs text-slate-700 hover:bg-brand-50 hover:text-brand-700 cursor-pointer"
+                            >
+                              <span className="font-medium">{a.name}</span>
+                              {a.district && <span className="text-slate-400 ml-1">{a.district}</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {filtered.length === 0 && (
+                <tr>
+                  <td colSpan={13} className="px-6 py-16 text-center">
+                    <div className="flex flex-col items-center justify-center space-y-3">
+                      {search ? (
+                        <>
+                          <div className="w-14 h-14 bg-slate-50 rounded-full flex items-center justify-center border border-slate-100">
+                            <Search className="w-6 h-6 text-slate-400" />
+                          </div>
+                          <div>
+                            <p className="text-base font-bold text-slate-900">No matches found</p>
+                            <p className="text-sm text-slate-500 mt-0.5">Try a different search term.</p>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="w-14 h-14 bg-emerald-50 rounded-full flex items-center justify-center border border-emerald-100 shadow-sm shadow-emerald-500/10">
+                            <Check className="w-7 h-7 text-emerald-500" />
+                          </div>
+                          <div>
+                            <p className="text-base font-bold text-slate-900">No skipped rows!</p>
+                            <p className="text-sm text-slate-500 mt-0.5">All your members are valid and ready to be imported.</p>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

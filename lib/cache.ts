@@ -1,0 +1,204 @@
+import { getRedisClient } from './redis'
+import { cacheKeys } from './cache-keys'
+
+/**
+ * Get a value from the Redis cache.
+ */
+export async function getCache<T>(key: string): Promise<T | null> {
+  const redis = getRedisClient()
+  if (!redis) return null
+
+  try {
+    const data = await redis.get<T>(key)
+
+    if (data !== null) {
+      if (process.env.NODE_ENV === 'development') console.log(`CACHE HIT: ${key}`)
+      return data
+    }
+
+    if (process.env.NODE_ENV === 'development') console.log(`CACHE MISS: ${key}`)
+    return null
+
+  } catch (error) {
+    console.warn(`[Cache Error] Failed to get key ${key}:`, error)
+    return null
+  }
+}
+
+/**
+ * Maximum payload we are willing to put in Upstash.
+ *
+ * Upstash is a REST-over-HTTPS cache, so a GET pays full request overhead plus
+ * transfer time. Measured against this project's actual Upstash instance:
+ *
+ *     0.5KB →  103ms        30KB →   723ms
+ *       5KB →  511ms        55KB →  2563ms
+ *      15KB →  511ms       200KB →  8405ms
+ *
+ * For comparison, re-running the members-page queries against Postgres returns
+ * the same data in ~409-613ms. So above roughly 15KB the "cache" is SLOWER than
+ * the database it is caching — the 55KB members_list key was costing 2.5s per
+ * page load to avoid ~0.5s of Postgres work.
+ *
+ * Anything larger than this is therefore not stored: the read path falls through
+ * to Postgres, which is faster. Keeping the guard here (rather than only fixing
+ * the two offending call sites) means a future large payload cannot silently
+ * reintroduce the regression.
+ */
+export const MAX_CACHEABLE_BYTES = 16 * 1024
+
+/**
+ * Set a value in the Redis cache with a TTL (Time To Live) in seconds.
+ *
+ * Silently skips payloads above MAX_CACHEABLE_BYTES — see the note above.
+ * Returns whether the value was actually stored.
+ */
+export async function setCache<T>(key: string, data: T, ttlSeconds: number): Promise<boolean> {
+  const redis = getRedisClient()
+  if (!redis) return false
+
+  try {
+    const bytes = Buffer.byteLength(JSON.stringify(data ?? null), 'utf8')
+    if (bytes > MAX_CACHEABLE_BYTES) {
+      if (process.env.NODE_ENV === 'development') {
+        console.warn(
+          `[Cache] SKIP SET ${key} — ${(bytes / 1024).toFixed(1)}KB exceeds the ` +
+          `${(MAX_CACHEABLE_BYTES / 1024).toFixed(0)}KB limit. Upstash reads get slower than ` +
+          `Postgres above ~15KB, so this is served from the database instead.`
+        )
+      }
+      return false
+    }
+
+    await redis.set(key, data, { ex: ttlSeconds })
+    return true
+  } catch (error) {
+    console.warn(`[Cache Error] Failed to set key ${key}:`, error)
+    return false
+  }
+}
+
+/**
+ * Delete a specific key from the cache.
+ */
+export async function deleteCache(key: string): Promise<void> {
+  const redis = getRedisClient()
+  if (!redis) return
+
+  try {
+    await redis.del(key)
+  } catch (error) {
+    console.warn(`[Cache Error] Failed to delete key ${key}:`, error)
+  }
+}
+
+/**
+ * Invalidate all keys matching a specific pattern (e.g., gym:123:members*)
+ * Note: Upstash SCAN is safe for production use.
+ */
+export async function invalidatePattern(pattern: string): Promise<void> {
+  const redis = getRedisClient()
+  if (!redis) return
+
+  try {
+    let cursor: string | number = 0
+    do {
+      const scanResult = await redis.scan(cursor, { match: pattern, count: 100 }) as [string | number, string[]]
+      const nextCursor = scanResult[0]
+      const keys = scanResult[1]
+      if (keys.length > 0) {
+        await redis.del(...keys)
+      }
+      cursor = nextCursor
+    } while (cursor !== 0 && cursor !== '0')
+  } catch (error) {
+    console.warn(`[Cache Error] Failed to invalidate pattern ${pattern}:`, error)
+  }
+}
+
+import type { RequestLogger } from '@/lib/logger'
+
+/**
+ * Schedules a cache write to run after the response is sent.
+ *
+ * Falls back to awaiting inline when `after()` is unavailable or throws — it
+ * requires a request scope, so a script or a background job calling
+ * `cacheWrapper` would otherwise lose the write entirely. Correctness first:
+ * a slower write beats a silently dropped one.
+ */
+async function deferCacheWrite(write: () => Promise<unknown>): Promise<void> {
+  try {
+    const { after } = await import('next/server')
+    after(() => {
+      void write().catch(() => {
+        // Already non-fatal: the next read simply misses and re-queries.
+      })
+    })
+  } catch {
+    await write().catch(() => {})
+  }
+}
+
+/**
+ * A higher-order wrapper that abstracts the cache lookup and miss logic.
+ * Guarantees that the app never crashes if Redis goes down.
+ */
+export async function cacheWrapper<T>(
+  key: string,
+  ttlSeconds: number,
+  fetchFn: () => Promise<T>,
+  logger?: RequestLogger
+): Promise<T> {
+  if (logger) logger.info('CACHE ENTER')
+  
+  try {
+    if (logger) logger.start('REDIS GET')
+    const startTime = Date.now()
+    const cachedData = await getCache<T>(key)
+    if (logger) logger.end('REDIS GET')
+
+    if (cachedData !== null) {
+      if (logger) logger.info('CACHE HIT')
+      if (logger) logger.info('RETURNING CACHED DATA')
+      logCacheMetric('HIT', key, Date.now() - startTime)
+      return cachedData
+    }
+
+    if (logger) logger.info('CACHE MISS')
+
+    // Cache Miss: Execute the database query
+    if (logger) logger.start('FETCHFN')
+    const freshData = await fetchFn()
+    if (logger) logger.end('FETCHFN')
+
+    // ── Store in cache WITHOUT blocking the response ────────────────────────
+    // The value the caller needs is already in hand, so awaiting the write only
+    // delays the render. Upstash is REST-over-HTTPS and a SET measures ~57ms
+    // against this project, which was landing on every cache miss for no gain.
+    //
+    // `after()` runs the write once the response has been sent, which is what
+    // makes it safe to skip the await on serverless — a bare floating promise can
+    // be killed when the invocation ends, losing the write and guaranteeing the
+    // next request misses too.
+    if (logger) logger.start('REDIS SET')
+    await deferCacheWrite(() => setCache(key, freshData, ttlSeconds))
+    if (logger) logger.end('REDIS SET')
+    
+    if (logger) logger.info('RETURNING FRESH DATA')
+    
+    // Backwards compatibility for global stats
+    logCacheMetric('MISS', key, Date.now() - startTime)
+    return freshData
+  } catch (error: any) {
+    if (logger) logger.error('ERROR', error)
+    throw error
+  }
+}
+
+// Internal metric logger — dev only, no global state (meaningless in serverless)
+function logCacheMetric(type: 'HIT' | 'MISS', key: string, durationMs: number) {
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[CACHE][Event] ${type}: ${key} - ${durationMs}ms`)
+  }
+}
+

@@ -1,0 +1,54 @@
+node_modules
+.next
+.env
+.env.local
+.env.*.local
+roles.sql
+schema.sql
+data.sql
+roles_old.sql
+schema_old.sql
+data_old.sql
+data_clean.sql
+/migrate
+# package-lock.json
+!landing-page/package-lock.json
+geo_normalization.sql
+supabase-geo-intelligence-migrations.sql
+GEO_INTELLIGENCE_MIGRATIONS.sql
+.vscode
+git_command.txt
+add_legacy_member_id.sq
+# .graphifyignore
+node_modules/
+dist/
+*.generated.py
+graphify-out/
+graphify-out
+youpi-pg/
+youpi-pg
+
+# Removing the block that ignores everything except src/ since this project uses app/ structure
+# Sentry Config File
+.env.sentry-build-plugin
+.vercel
+
+# Serwist / PWA — generated at build time from app/sw.ts
+public/sw.js
+public/sw.js.map
+public/swe-worker-*.js
+
+/output
+/films
+/.agents
+/.claude
+skills-lock.json
+# Internal notes, audits and AI hand-off prompts. Not part of the public repository.
+/docs/
+
+# Firebase / Google client config and service-account keys: never committed, from any folder.
+# A Google API key in google-services.json was once published this way (GitHub secret-scanning alert #1).
+**/google-services.json
+**/GoogleService-Info.plist
+**/*service-account*.json
+**/*firebase-adminsdk*.json

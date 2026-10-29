@@ -1,0 +1,243 @@
+# robots.txt for the GymFlow marketing site — https://www.gymflow.sbs
+#
+# ─── WHY THIS IS A STATIC FILE AND NOT robots.ts ────────────────────────────
+# `app/robots.ts` is a Next.js App Router convention. This project is Vite +
+# React, so that file would never be compiled or served. Vite copies everything
+# in `public/` verbatim into `dist/`, so this lands at /robots.txt in the build.
+#
+# ─── HISTORY: CLOUDFLARE USED TO OVERRIDE THIS FILE (RESOLVED) ──────────────
+# Cloudflare's managed robots.txt feature used to replace this file entirely with
+# its own version, which:
+#   - set Content-Signal: search=yes,ai-train=no,use=reference
+#   - Disallowed GPTBot, ClaudeBot, CCBot, Google-Extended, Bytespider,
+#     Amazonbot, Applebot-Extended and meta-externalagent
+#   - DROPPED the Sitemap line at the bottom of this file
+#
+# That was Cloudflare's default, not a decision made here, and it silently
+# blocked every AI crawler while breaking sitemap auto-discovery.
+#
+# It has been disabled and the cache purged; this file is now the live one
+# (verified: the served response contains the Sitemap line and none of the
+# Disallow rules above).
+#
+# IF AI CRAWLERS OR THE SITEMAP LINE EVER VANISH AGAIN, that setting has been
+# re-enabled. Check: Cloudflare dashboard -> gymflow.sbs zone -> AI Crawl Control
+# (older accounts: Security -> Bots, or Settings -> Manage robots.txt), turn the
+# managed robots.txt / "Block AI bots" setting OFF, then Caching -> Purge cache
+# for /robots.txt. Verify with:
+#   curl -s https://www.gymflow.sbs/robots.txt
+#
+# ─── HOST: www, NOT THE APEX ────────────────────────────────────────────────
+# https://gymflow.sbs/* returns 301 -> https://www.gymflow.sbs/* (observed with
+# `curl -sI https://gymflow.sbs/`), so www is the canonical host.
+# The Sitemap URL below must use www: Google Search Console does not follow
+# redirects for sitemap URLs and reports a redirecting one as
+# "Sitemap could not be read".
+#
+# ─── THIS DOMAIN IS THE ONE THAT SHOULD RANK ────────────────────────────────
+# The two hosts have deliberately opposite policies:
+#
+#   gymflow.sbs      (this site)  public marketing page  -> index everything
+#   app.gymflow.sbs  (the app)    owner/member console   -> disallow everything
+#
+# The app host is fully disallowed because every route there is auth-gated or
+# carries a one-time token, and its `/` only redirects to login. All search
+# visibility is meant to come from this domain.
+#
+# ─── NOTHING IS DISALLOWED HERE, ON PURPOSE ─────────────────────────────────
+# The build output is a multi-page static site: the homepage, /features and its
+# feature pages, /pricing and the legal pages, plus their assets. There is no
+# admin area, no API and no private route to protect, and blocking the CSS/JS
+# bundles would stop Google rendering the pages and hurt ranking. If a private path is ever added to this host, add it here AND
+# give the page a `noindex` meta tag — robots.txt alone does not guarantee a URL
+# stays out of search results.
+#
+# ─── AI CRAWLERS ARE ALLOWED, DELIBERATELY ──────────────────────────────────
+# Being quotable in ChatGPT, Claude, Perplexity and AI search summaries is free
+# distribution for a marketing page, so every AI crawler is permitted.
+#
+# The per-agent groups below are technically redundant — `User-agent: *` with
+# `Allow: /` already permits them. They are spelled out because a robots.txt
+# user-agent group OVERRIDES the wildcard for that agent, so if Cloudflare's
+# managed robots.txt (or anything else) ever reintroduces a Disallow for one of
+# these, the conflict is obvious in a diff instead of silent.
+#
+# Content-Signal is repeated inside every named group below: a crawler that matches a
+# named group reads only that group and ignores the `*` one, so without the repeat it
+# would never see the signal.
+#
+# Content-Signal is Cloudflare's directive, mirrored here with permissive values
+# so this file states the opposite of Cloudflare's default
+# (search=yes,ai-train=no,use=reference). It is advisory; most crawlers ignore it.
+
+User-agent: *
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+# Explicitly allowed AI / LLM crawlers — the exact set Cloudflare was blocking.
+User-agent: GPTBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: OAI-SearchBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: ChatGPT-User
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: ClaudeBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Claude-Web
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: anthropic-ai
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: PerplexityBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Google-Extended
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Applebot-Extended
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: CCBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Amazonbot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Bytespider
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: meta-externalagent
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: cohere-ai
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+# The newer wave of AI agents, added for the same tripwire reason as the block
+# above rather than because they need permission — `User-agent: *` already grants
+# it. Several of these appear in Cloudflare's block list but not in the original
+# set it was blocking here, so without an explicit group a future managed-robots
+# override could quietly disallow them and leave no diff to notice.
+#
+# Note the pattern: the crawler that trains and the fetcher that answers a live
+# user question are usually SEPARATE agents (PerplexityBot vs Perplexity-User,
+# meta-externalagent vs Meta-ExternalFetcher). Allowing only the first still
+# leaves the product invisible when someone actually asks about it.
+User-agent: Perplexity-User
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+# Anthropic's search and live-answer fetchers, separate from ClaudeBot above.
+User-agent: Claude-SearchBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Claude-User
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Meta-ExternalFetcher
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: MistralAI-User
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: DuckAssistBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Applebot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: GoogleOther
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Google-CloudVertexBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: YouBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Ai2Bot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Ai2Bot-Dolma
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Diffbot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: ImagesiftBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Omgilibot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: omgili
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Timpibot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: Webzio-Extended
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: PanguBot
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: FirecrawlAgent
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+User-agent: SemrushBot-OCOB
+Content-Signal: search=yes,ai-input=yes,ai-train=yes,use=full
+Allow: /
+
+# ─── /llms.txt ──────────────────────────────────────────────────────────────
+# A plain-language summary of the product for language models, served at
+# https://www.gymflow.sbs/llms.txt (source: public/llms.txt).
+#
+# This is a comment, not a directive. robots.txt has no field for declaring an
+# llms.txt, and inventing one like `Llms:` would just be an unparsed line — the
+# note is here so anyone auditing crawler policy finds the file.
+
+# sitemap.xml lists every public page: the homepage, /features and each feature
+# page, /pricing and the legal pages. #features, #pricing etc. on the homepage are
+# in-page anchors, not separate URLs. Keep the file free of explanatory comments:
+# an earlier version carried one that included literal loc and lastmod tag text,
+# which is valid XML but invites lenient parsers to match the comment instead of
+# the real element.
+Sitemap: https://www.gymflow.sbs/sitemap.xml

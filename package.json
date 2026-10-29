@@ -1,0 +1,93 @@
+{
+  "name": "GymFlow",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3004",
+    "dev:turbo": "next dev -p 3004 --turbopack",
+    "perf:prod": "next build && next start -p 3100",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "prepare": "husky",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "verify:whatsapp": "tsx scripts/verify-whatsapp-setup.ts",
+    "verify:tour": "tsx scripts/verify-tour-anchors.ts"
+  },
+  "dependencies": {
+    "@googlemaps/js-api-loader": "^2.0.2",
+    "@sentry/nextjs": "^10.60.0",
+    "@serwist/next": "9.5.12",
+    "@supabase/ssr": "^0.10.2",
+    "@supabase/supabase-js": "^2.105.3",
+    "@tanstack/react-query": "5.90.2",
+    "@upstash/qstash": "^2.11.1",
+    "@upstash/ratelimit": "^2.0.8",
+    "@upstash/redis": "^1.38.0",
+    "clsx": "^2.1.1",
+    "date-fns": "^3.6.0",
+    "driver.js": "1.8.0",
+    "exceljs": "^4.4.0",
+    "framer-motion": "^12.39.0",
+    "jose": "^5.10.0",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.7",
+    "jsqr": "^1.4.0",
+    "lucide-react": "^0.383.0",
+    "next": "^15.5.27",
+    "nextjs-toploader": "^3.9.17",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.1.3",
+    "qrcode": "1.5.4",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-hot-toast": "^2.6.0",
+    "recharts": "^3.8.1",
+    "resend": "^6.30.0",
+    "server-only": "^0.0.1",
+    "serwist": "9.5.12",
+    "tailwind-merge": "^2.6.1",
+    "three": "0.180.0",
+    "use-places-autocomplete": "^4.0.1",
+    "web-push": "^3.6.7",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@types/three": "0.180.0",
+    "@types/web-push": "^3.6.4",
+    "@typescript-eslint/parser": "^8.0.0",
+    "autoprefixer": "^10.0.1",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.5.27",
+    "husky": "^9.1.7",
+    "postcss": "^8",
+    "shadcn": "^4.21.4",
+    "supabase": "^2.121.0",
+    "tailwindcss": "^3.4.1",
+    "tsx": "^4.23.0",
+    "typescript": "^5",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "browserslist": "^4.29.3",
+    "next": {
+      "postcss": "^8.5.29"
+    },
+    "exceljs": {
+      "uuid": "^11.1.1"
+    },
+    "postcss-nested": {
+      "postcss-selector-parser": "^7.1.6"
+    },
+    "tailwindcss": {
+      "postcss-selector-parser": "^7.1.6"
+    }
+  }
+}

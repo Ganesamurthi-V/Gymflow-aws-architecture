@@ -1,0 +1,467 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { logger } from '@/lib/logger'
+import { checkRateLimit, ROUTE_LIMITS } from '@/lib/rateLimit'
+import { roleFromClaims } from '@/lib/auth/roles'
+import { ownerMobileFromUser } from '@/lib/auth/phone'
+import { passesCsrf } from '@/app/api/_guard'
+import { recordOwnerAction } from '@/lib/activity/record'
+import { assertGymWritableById } from '@/lib/subscriptionGuard'
+import { getPlanPrices } from '@/lib/plans/prices'
+
+interface MembershipPlan {
+  planName: string
+  category: 'strength' | 'cardio' | 'both'
+  duration: 'monthly' | 'quarterly' | 'annual' | 'custom'
+  price: number
+  joiningFee: number
+  hasDiscount: boolean
+  discountPercent: number
+  hasFreezeOption: boolean
+  customDurationMonths?: number
+}
+
+type DatabaseError = {
+  code?: string
+  message?: string
+  details?: string
+  hint?: string
+}
+
+type OnboardingRequest = {
+  gymId: string | null
+  gymName: string
+  gymType: string
+  address: string
+  openingYear: number
+  city: string
+  plans: MembershipPlan[]
+}
+
+type ValidationResult =
+  | { ok: true; data: OnboardingRequest }
+  | { ok: false; message: string }
+
+const log = logger.child({ component: 'ONBOARDING_COMPLETE' })
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const GYM_TYPES = new Set(['Gym', 'Fitness Center', 'CrossFit', 'Yoga Studio', 'Martial Arts', 'Other'])
+
+function errorResponse(code: string, message: string, status: number, retryable = false) {
+  return NextResponse.json(
+    { success: false, error: { code, message, retryable } },
+    { status, headers: { 'Cache-Control': 'no-store' } },
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function optionalString(value: unknown, maxLength: number): string | null {
+  if (value === undefined || value === null) return ''
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length <= maxLength ? trimmed : null
+}
+
+function validateRequest(raw: unknown): ValidationResult {
+  if (!isRecord(raw)) {
+    return { ok: false, message: 'We could not read your setup details. Please refresh the page and try again.' }
+  }
+
+  const gymName = optionalString(raw.gymName, 100)
+  if (gymName === null || gymName.length < 2) {
+    return { ok: false, message: 'Enter a gym name with at least 2 characters.' }
+  }
+
+  const gymIdValue = raw.gymId
+  const gymId = typeof gymIdValue === 'string' && gymIdValue.trim() ? gymIdValue.trim() : null
+  if (gymId && !UUID_PATTERN.test(gymId)) {
+    return { ok: false, message: 'Your gym setup link is no longer valid. Refresh the page and try again.' }
+  }
+
+  const gymType = optionalString(raw.gymType, 40)
+  if (gymType === null || !GYM_TYPES.has(gymType || 'Gym')) {
+    return { ok: false, message: 'Choose a valid gym type.' }
+  }
+
+  const openingYear = Number(raw.openingYear ?? new Date().getFullYear())
+  const latestOpeningYear = new Date().getFullYear() + 1
+  if (!Number.isInteger(openingYear) || openingYear < 1900 || openingYear > latestOpeningYear) {
+    return { ok: false, message: `Opening year must be between 1900 and ${latestOpeningYear}.` }
+  }
+
+  const city = optionalString(raw.city, 200)
+  if (city === null) {
+    return { ok: false, message: 'City is too long. Choose a shorter city name and try again.' }
+  }
+
+  const address = optionalString(raw.address, 500)
+  if (address === null) {
+    return { ok: false, message: 'Address is too long. Keep it under 500 characters.' }
+  }
+
+  if (raw.plans !== undefined && !Array.isArray(raw.plans)) {
+    return { ok: false, message: 'Your membership plans could not be read. Go back to Membership Plans and try again.' }
+  }
+
+  const rawPlans = (raw.plans ?? []) as unknown[]
+  if (rawPlans.length > 50) {
+    return { ok: false, message: 'You can add up to 50 membership plans during setup.' }
+  }
+
+  // Plans are stored in onboarding_data and their prices are copied into
+  // gym_plan_prices, so every field is checked and only known keys are kept.
+  const planError = { ok: false as const, message: 'One of your membership plans has an invalid name, price or duration.' }
+  const money = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 10_000_000
+  const plans: MembershipPlan[] = []
+  for (const p of rawPlans) {
+    if (!isRecord(p)) return planError
+    const planName = typeof p.planName === 'string' ? p.planName.trim() : ''
+    if (planName.length > 100) return planError
+    if (!['strength', 'cardio', 'both'].includes(p.category as string)) return planError
+    if (!['monthly', 'quarterly', 'annual', 'custom'].includes(p.duration as string)) return planError
+    if (!money(p.price) || !money(p.joiningFee ?? 0)) return planError
+    const discountPercent = p.discountPercent === undefined ? 0 : p.discountPercent
+    if (typeof discountPercent !== 'number' || !(discountPercent >= 0 && discountPercent <= 100)) return planError
+    let customDurationMonths: number | undefined
+    if (p.customDurationMonths !== undefined && p.customDurationMonths !== null) {
+      const m = p.customDurationMonths
+      if (typeof m !== 'number' || !Number.isInteger(m) || m < 0 || m > 120) return planError
+      customDurationMonths = m
+    }
+    plans.push({
+      planName,
+      category: p.category as MembershipPlan['category'],
+      duration: p.duration as MembershipPlan['duration'],
+      price: p.price as number,
+      joiningFee: (p.joiningFee ?? 0) as number,
+      hasDiscount: p.hasDiscount === true,
+      discountPercent,
+      hasFreezeOption: p.hasFreezeOption === true,
+      ...(customDurationMonths !== undefined ? { customDurationMonths } : {}),
+    })
+  }
+
+  return {
+    ok: true,
+    data: {
+      gymId,
+      gymName,
+      gymType: gymType || 'Gym',
+      address,
+      openingYear,
+      city,
+      plans,
+    },
+  }
+}
+
+/**
+ * PostgREST rejects the whole write before touching the row when a submitted column is not
+ * present in its schema cache. Older GymFlow databases store city and phone only inside
+ * onboarding_data, so those mirrors are optional compatibility writes rather than grounds
+ * to block the owner from completing setup.
+ */
+function isMissingContactColumn(error: DatabaseError | null): boolean {
+  if (!error) return false
+  const text = `${error.message ?? ''} ${error.details ?? ''} ${error.hint ?? ''}`.toLowerCase()
+  const namesContactColumn = text.includes("'city'") || text.includes('"city"') ||
+    text.includes("'phone'") || text.includes('"phone"')
+  return namesContactColumn && (error.code === 'PGRST204' || text.includes('schema cache'))
+}
+
+function databaseErrorDetails(error: DatabaseError | null) {
+  return {
+    code: error?.code ?? 'UNKNOWN',
+    error: error?.message ?? 'Database returned no row and no error',
+    details: error?.details,
+    hint: error?.hint,
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    if (!passesCsrf(req)) return errorResponse('CSRF_REJECTED', 'Forbidden', 403)
+
+    const supabase = await createClient()
+    const { data: { user }, error: authError } = await supabase.auth.getUser()
+
+    if (authError || !user) {
+      return errorResponse(
+        'UNAUTHORIZED',
+        'Your session has expired. Sign in again to finish setting up your gym.',
+        401,
+      )
+    }
+
+    // A member login must never create a gym (and a trial subscription) of its own.
+    if (roleFromClaims(user) === 'member') {
+      return errorResponse('FORBIDDEN', 'Member accounts cannot set up a gym.', 403)
+    }
+
+    const { allowed } = await checkRateLimit(user.id, '/api/onboarding/complete', ROUTE_LIMITS.DEFAULT)
+    if (!allowed) {
+      return errorResponse(
+        'RATE_LIMITED',
+        'Too many setup attempts. Wait a minute, then try again.',
+        429,
+        true,
+      )
+    }
+
+    let rawBody: unknown
+    try {
+      rawBody = await req.json()
+    } catch {
+      return errorResponse(
+        'INVALID_REQUEST',
+        'We could not read your setup details. Refresh the page and try again.',
+        400,
+      )
+    }
+
+    const validation = validateRequest(rawBody)
+    if (!validation.ok) {
+      return errorResponse('VALIDATION_ERROR', validation.message, 400)
+    }
+
+    const {
+      gymId,
+      gymName,
+      gymType,
+      address,
+      openingYear,
+      city,
+      plans,
+    } = validation.data
+
+    const onboardingData = {
+      gymType,
+      address,
+      openingYear,
+      city,
+      plans,
+      completedAt: new Date().toISOString(),
+    }
+
+    /*
+      Resolve by owner when gymId is absent. This makes the endpoint idempotent after a
+      partial failure: if a first attempt created the gym but failed later while syncing
+      prices, retrying updates that same gym instead of attempting a duplicate insert.
+    */
+    let targetGymId = gymId
+    if (!targetGymId) {
+      const { data: existingGym, error: lookupError } = await supabase
+        .from('gyms')
+        .select('id')
+        .eq('owner_id', user.id)
+        .maybeSingle()
+
+      if (lookupError) {
+        log.error('Could not resolve gym during onboarding', databaseErrorDetails(lookupError))
+        return errorResponse(
+          'DATABASE_ERROR',
+          'We could not load your gym details right now. Please try again.',
+          500,
+          true,
+        )
+      }
+      targetGymId = existingGym?.id ?? null
+    }
+
+    // Saves the onboarding details onto an existing gym. Returns an error response, or null on
+    // success. A function because two paths end here: the gym already existed, or the insert
+    // below lost a race against a concurrent request that created it (unique owner_id).
+    const saveOnExistingGym = async (id: string) => {
+      // A lapsed gym is read-only on the server; this route authenticates on its own, so it has
+      // to apply the guard itself or an expired owner could still rewrite the gym and its prices.
+      const notWritable = await assertGymWritableById(supabase, id)
+      if (notWritable) return notWritable
+
+      const coreUpdate = {
+        name: gymName,
+        onboarding_completed: true,
+        onboarding_data: onboardingData,
+      }
+
+      const updateWithContact = await supabase
+        .from('gyms')
+        .update({ ...coreUpdate, city: city || null })
+        .eq('id', id)
+        .eq('owner_id', user.id)
+        .select('id')
+        .maybeSingle()
+
+      let updatedGym = updateWithContact.data
+      let updateError = updateWithContact.error
+
+      if (isMissingContactColumn(updateError)) {
+        /*
+          Keep setup working while the migration reaches every environment. The contact
+          values are still persisted in onboarding_data, which is the canonical fallback
+          used for existing gyms. We log the internal cause but do not show PostgREST's
+          schema-cache wording to the owner.
+        */
+        log.warn('Contact columns unavailable; saving onboarding data without mirrors', {
+          code: updateError?.code,
+          missingColumns: 'city',
+        })
+
+        const fallbackUpdate = await supabase
+          .from('gyms')
+          .update(coreUpdate)
+          .eq('id', id)
+          .eq('owner_id', user.id)
+          .select('id')
+          .maybeSingle()
+
+        updatedGym = fallbackUpdate.data
+        updateError = fallbackUpdate.error
+      }
+
+      if (updateError) {
+        log.error('Could not save onboarding details', databaseErrorDetails(updateError))
+        return errorResponse(
+          'DATABASE_ERROR',
+          'We could not save your gym setup right now. Your details are still on this device—please try again.',
+          500,
+          true,
+        )
+      }
+
+      if (!updatedGym) {
+        log.warn('Onboarding update matched no gym', { userId: user.id, hasGymId: Boolean(gymId) })
+        return errorResponse(
+          'GYM_NOT_FOUND',
+          'We could not find this gym on your account. Refresh the page and try again.',
+          404,
+        )
+      }
+      return null
+    }
+
+    if (targetGymId) {
+      const failed = await saveOnExistingGym(targetGymId)
+      if (failed) return failed
+    } else {
+      // No gym yet, so this call would create it. It must honour the same mobile-number gate as
+      // /api/auth/finalize-registration. user_metadata is user-editable, so this is a "we asked"
+      // check, not a security boundary.
+      if (!ownerMobileFromUser(user)) {
+        return errorResponse('PHONE_REQUIRED', 'Add your mobile number to continue.', 403)
+      }
+
+      const parsedTrialDays = Number.parseInt(process.env.TRIAL_DURATION_DAYS ?? '14', 10)
+      const trialDays = Number.isInteger(parsedTrialDays) && parsedTrialDays >= 1 && parsedTrialDays <= 31 ? parsedTrialDays : 14
+      const now = new Date()
+      const trialEndsAt = new Date(now)
+      trialEndsAt.setDate(trialEndsAt.getDate() + trialDays)
+
+      const coreInsert = {
+        name: gymName,
+        owner_id: user.id,
+        onboarding_completed: true,
+        onboarding_data: onboardingData,
+        subscription_status: 'trial',
+        plan_type: 'trial',
+        trial_started_at: now.toISOString(),
+        trial_ends_at: trialEndsAt.toISOString(),
+      }
+
+      const insertWithContact = await supabase
+        .from('gyms')
+        .insert({ ...coreInsert, city: city || null })
+        .select('id')
+        .single()
+
+      let newGym = insertWithContact.data
+      let insertError = insertWithContact.error
+
+      if (isMissingContactColumn(insertError)) {
+        log.warn('Contact columns unavailable; creating gym without mirrors', {
+          code: insertError?.code,
+          missingColumns: 'city',
+        })
+
+        const fallbackInsert = await supabase
+          .from('gyms')
+          .insert(coreInsert)
+          .select('id')
+          .single()
+
+        newGym = fallbackInsert.data
+        insertError = fallbackInsert.error
+      }
+
+      if (insertError?.code === '23505') {
+        // A concurrent request created this owner's gym between the lookup and the insert
+        // (gyms.owner_id is unique). Continue as an update on that gym, like
+        // /api/auth/finalize-registration, instead of failing with a 500.
+        const { data: raceGym, error: raceError } = await supabase
+          .from('gyms')
+          .select('id')
+          .eq('owner_id', user.id)
+          .maybeSingle()
+        if (raceError || !raceGym) {
+          log.error('Could not load gym after duplicate insert', databaseErrorDetails(raceError))
+          return errorResponse(
+            'DATABASE_ERROR',
+            'We could not create your gym right now. Your details are still on this device—please try again.',
+            500,
+            true,
+          )
+        }
+        const failed = await saveOnExistingGym(raceGym.id)
+        if (failed) return failed
+        targetGymId = raceGym.id
+      } else if (insertError || !newGym) {
+        log.error('Could not create gym during onboarding', databaseErrorDetails(insertError))
+        return errorResponse(
+          'DATABASE_ERROR',
+          'We could not create your gym right now. Your details are still on this device—please try again.',
+          500,
+          true,
+        )
+      } else {
+        targetGymId = newGym.id
+      }
+    }
+
+    if (plans.length > 0 && targetGymId) {
+      const { error: planError } = await supabase.from('gym_plan_prices').upsert(
+        {
+          gym_id: targetGymId,
+          ...getPlanPrices(plans),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'gym_id' },
+      )
+
+      if (planError) {
+        log.error('Gym saved but plan prices could not be synchronized', databaseErrorDetails(planError))
+        return errorResponse(
+          'PLAN_SYNC_ERROR',
+          'Your gym details were saved, but we could not save your membership prices. Please try again.',
+          500,
+          true,
+        )
+      }
+    }
+
+
+    recordOwnerAction(supabase, req, 'ONBOARDING_COMPLETE')
+    return NextResponse.json(
+      { success: true, data: { gymId: targetGymId } },
+      { headers: { 'Cache-Control': 'no-store' } },
+    )
+  } catch (error: unknown) {
+    log.error('Unexpected onboarding completion error', error)
+    return errorResponse(
+      'INTERNAL_ERROR',
+      'Something went wrong while finishing your setup. Your details are still on this device—please try again.',
+      500,
+      true,
+    )
+  }
+}

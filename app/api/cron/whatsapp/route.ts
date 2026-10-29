@@ -1,0 +1,89 @@
+/**
+ * POST /api/cron/whatsapp
+ *
+ * Daily cron job that sends scheduled WhatsApp automation messages:
+ *  - membership_expiry_reminder  (every 3 days, up to 7 times)
+ *  - membership_expired          (every 3 days, up to 7 times)
+ *  - payment_due_reminder        (every 3 days, up to 7 times)
+ *  - _birthday_wishes             (once per year on member's birthday)
+ *
+ * and, as one more step of the same run, the gamification nudges (at most ONE per
+ * member per day, in this priority; gyms with leaderboards switched off are skipped):
+ *  - gym_streak_at_risk          (streak of 3+ days still waiting for today's check-in)
+ *  - gym_weekly_goal_reached     (weekly goal reached; once per ISO week)
+ *  - gym_leaderboard_rank_up     (alone at #1 on the last-7-days board; once per 7 days)
+ * These are OFF until each template is approved in Meta and listed in
+ * ENABLED_GAMIFICATION_TEMPLATES (config/whatsapp.ts). Counts are in stats.gamification.
+ *
+ * Nothing is sent from here directly: every message is queued in whatsapp_send_queue
+ * and delivered by /api/whatsapp/queue/drain.
+ *
+ * Security: Protected by CRON_SECRET header.
+ * Vercel Cron calls this automatically based on vercel.json schedule.
+ *
+ * Manual trigger: POST /api/cron/whatsapp
+ *   Header: x-cron-secret: <CRON_SECRET>
+ */
+
+import { NextRequest, NextResponse } from 'next/server'
+import { runDailyWhatsAppAutomation } from '@/lib/whatsapp/automation'
+import { timingSafeSecretEqual } from '@/lib/monitoring/health'
+import { pingHeartbeat } from '@/lib/monitoring/heartbeat'
+import { reportAlert } from '@/lib/monitoring/alert'
+import { markCronOk } from '@/lib/monitoring/cronStatus'
+
+export const dynamic = 'force-dynamic'
+export const maxDuration = 60 // Allow up to 60 seconds for large gyms
+
+export async function POST(req: NextRequest) {
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  const cronSecret = process.env.CRON_SECRET
+  if (!cronSecret) {
+    console.error('[Cron/WA] CRON_SECRET env var not set')
+    await reportAlert({ key: 'cron:secret_missing', severity: 'critical', title: 'CRON_SECRET is not set',
+      body: 'Scheduled jobs are being rejected because CRON_SECRET is missing on the server.' })
+    return NextResponse.json({ error: 'Server misconfigured' }, { status: 500 })
+  }
+
+  // Vercel sends the secret as Authorization: Bearer <secret>
+  // Manual callers can use x-cron-secret header
+  const authHeader    = req.headers.get('authorization') ?? ''
+  const cronHeader    = req.headers.get('x-cron-secret') ?? ''
+  const bearerToken   = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+  const isAuthorized  = timingSafeSecretEqual(bearerToken, cronSecret) || timingSafeSecretEqual(cronHeader, cronSecret)
+
+  if (!isAuthorized) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  // ── Run ───────────────────────────────────────────────────────────────────
+  const startMs = Date.now()
+  console.log('[Cron/WA] Starting daily WhatsApp automation...')
+
+  try {
+    const stats = await runDailyWhatsAppAutomation()
+    const durationMs = Date.now() - startMs
+
+    console.log(`[Cron/WA] Done in ${durationMs}ms:`, stats)
+
+    // Only after a successful run, so a missed ping means the cron failed or never ran.
+    await pingHeartbeat(process.env.BETTERSTACK_HEARTBEAT_WHATSAPP)
+    await markCronOk('whatsapp')
+
+    return NextResponse.json({
+      success: true,
+      durationMs,
+      stats,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error('[Cron/WA] Fatal error:', message)
+    await reportAlert({ key: 'cron:whatsapp:failed', severity: 'critical', title: 'Daily WhatsApp cron failed', body: message })
+    return NextResponse.json({ success: false, error: 'Internal error' }, { status: 500 })
+  }
+}
+
+// Allow GET for Vercel's cron ping (Vercel always uses GET for scheduled crons)
+export async function GET(req: NextRequest) {
+  return POST(req)
+}

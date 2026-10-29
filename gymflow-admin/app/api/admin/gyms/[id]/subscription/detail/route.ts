@@ -1,0 +1,152 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { verifyRequestAuth } from '@/lib/auth'
+import { createAdminClient } from '@/lib/supabase-admin'
+import { sanitizeUUID } from '@/lib/sanitize'
+
+export const dynamic = 'force-dynamic'
+
+/** GET /api/admin/gyms/[id]/subscription/detail
+ *  Returns full subscription data, owner info, pending requests, audit logs, usage stats.
+ */
+export async function GET(req: NextRequest, props: { params: Promise<{ id: string }> }) {
+  if (!(await verifyRequestAuth(req))) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+  try {
+    const id = sanitizeUUID((await props.params).id)
+    if (!id) return NextResponse.json({ error: 'Invalid gym id' }, { status: 400 })
+    const supabase = createAdminClient()
+
+    // Fetch gym + all subscription columns.
+    // `phone` and `onboarding_data` are selected so a gym's contact number can be
+    // surfaced — the "Manage Subscription" screen was showing PHONE as "—" only
+    // because neither was fetched here (the sibling /gyms/[gymId] route already
+    // selects them; this one had drifted).
+    const { data: gym, error: gymError } = await supabase
+      .from('gyms')
+      .select(`
+        id, name, owner_id, is_active, created_at,
+        phone, onboarding_data,
+        subscription_status, plan_type,
+        trial_started_at, trial_ends_at,
+        subscription_started_at, subscription_ends_at,
+        is_vip, is_payment_verified, whatsapp_enabled,
+        priority_support, auto_renewal_eligible, lifetime_offer, login_disabled,
+        last_payment_amount, last_payment_method, last_transaction_id,
+        last_payment_date, last_payment_status,
+        whatsapp_addon_until
+      `)
+      .eq('id', id)
+      .single()
+
+    if (gymError) throw gymError
+
+    // Fetch owner info from auth.users
+    let owner = null
+    let ownerMobile: string | null = null
+    if (gym.owner_id) {
+      const { data: { user } } = await supabase.auth.admin.getUserById(gym.owner_id)
+      if (user) {
+        // The number the owner typed at signup lives in user_metadata.mobile_number.
+        // `user.phone` is the native phone-auth field and is empty for email signups,
+        // so it must not be the only source. Same resolution as /gyms/[gymId].
+        ownerMobile =
+          (typeof user.user_metadata?.mobile_number === 'string' && user.user_metadata.mobile_number.trim()) ||
+          user.phone ||
+          null
+        owner = {
+          email: user.email,
+          created_at: user.created_at,
+          last_sign_in_at: user.last_sign_in_at,
+          email_confirmed_at: user.email_confirmed_at,
+          phone: ownerMobile,
+          user_metadata: user.user_metadata,
+          app_metadata: user.app_metadata,
+        }
+      }
+    }
+
+    // Resolve the phone shown on the gym card. Prefer the gym's own contact number
+    // (column, then the onboarding_data blob it lived in before the column existed),
+    // then fall back to the owner's signup mobile so the field is populated even
+    // when the gym never set a separate contact number.
+    const onboarding = (gym.onboarding_data ?? {}) as Record<string, unknown>
+    const onboardingPhone = typeof onboarding.phone === 'string' ? onboarding.phone.trim() : ''
+    const resolvedGymPhone = (gym.phone?.trim?.() || onboardingPhone || ownerMobile) ?? null
+    const { data: notesRow, error: notesErr } = await supabase
+      .from('gym_admin_notes')
+      .select('notes')
+      .eq('gym_id', id)
+      .maybeSingle()
+    if (notesErr) throw notesErr
+    // Response keeps the `admin_notes` field so web + mobile clients are unchanged.
+    const gymWithPhone = { ...gym, phone: resolvedGymPhone, admin_notes: notesRow?.notes ?? null }
+
+    // Fetch pending subscription request
+    const { data: pendingRequest } = await supabase
+      .from('subscription_requests')
+      .select('*')
+      .eq('gym_id', id)
+      .eq('status', 'pending')
+      .order('submitted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    let pendingRequestWithUrl = pendingRequest || null;
+    if (pendingRequestWithUrl?.uploaded_file_url) {
+      const { data } = await supabase.storage
+        .from('Payments_proof')
+        .createSignedUrl(pendingRequestWithUrl.uploaded_file_url, 3600)
+      if (data?.signedUrl) {
+        pendingRequestWithUrl = { ...pendingRequestWithUrl, uploaded_file_url: data.signedUrl }
+      }
+    }
+
+    // Fetch last approved payment info
+    const { data: lastApprovedRequest } = await supabase
+      .from('subscription_requests')
+      .select('*')
+      .eq('gym_id', id)
+      .eq('status', 'approved')
+      .order('reviewed_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    let lastApprovedRequestWithUrl = lastApprovedRequest || null;
+    if (lastApprovedRequestWithUrl?.uploaded_file_url) {
+      const { data } = await supabase.storage
+        .from('Payments_proof')
+        .createSignedUrl(lastApprovedRequestWithUrl.uploaded_file_url, 3600)
+      if (data?.signedUrl) {
+        lastApprovedRequestWithUrl = { ...lastApprovedRequestWithUrl, uploaded_file_url: data.signedUrl }
+      }
+    }
+
+    // Fetch audit timeline (last 50)
+    const { data: timeline } = await supabase
+      .from('subscription_audit_logs')
+      .select('*')
+      .eq('gym_id', id)
+      .order('created_at', { ascending: false })
+      .limit(50)
+
+    // Fetch usage stats
+    const { data: usageStats } = await supabase
+      .from('gym_usage_stats')
+      .select('*')
+      .eq('gym_id', id)
+      .maybeSingle()
+
+    return NextResponse.json({
+      gym: gymWithPhone,
+      owner,
+      pendingRequest: pendingRequestWithUrl,
+      lastApprovedRequest: lastApprovedRequestWithUrl,
+      timeline: timeline || [],
+      usageStats: usageStats || null,
+    })
+  } catch (err: any) {
+    console.error('[SubDetail]', err)
+    return NextResponse.json({ error: 'Request failed' }, { status: 500 })
+  }
+}

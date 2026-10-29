@@ -1,0 +1,81 @@
+import { redis } from './redis'
+import { NextRequest, NextResponse } from 'next/server'
+
+/**
+ * Rate limiting middleware for admin panel API routes
+ * Prevents abuse by limiting requests per IP address
+ */
+/**
+ * Client IP that a caller cannot forge. The first x-forwarded-for entry is
+ * whatever the client sent; the platform (Vercel) appends the real peer as the
+ * LAST hop, and also sets x-real-ip itself. So prefer x-real-ip, then the last hop.
+ */
+export function getClientIp(req: NextRequest): string {
+  const real = req.headers.get('x-real-ip')?.trim()
+  if (real) return real
+  const hops = req.headers.get('x-forwarded-for')?.split(',').map(h => h.trim()).filter(Boolean)
+  return hops?.length ? hops[hops.length - 1] : 'unknown'
+}
+
+export async function rateLimit(
+  req: NextRequest,
+  key: string,
+  limit: number,
+  windowSeconds: number
+): Promise<NextResponse | null> {
+  const ip = getClientIp(req)
+  const rateLimitKey = `rate_limit:${key}:${ip}`
+
+  try {
+    const current = await redis.incr(rateLimitKey)
+    
+    // Set expiry only on first request
+    if (current === 1) {
+      await redis.expire(rateLimitKey, windowSeconds)
+    }
+
+    if (current > limit) {
+      return NextResponse.json(
+        { error: 'Too many requests. Please try again later.' },
+        { 
+          status: 429,
+          headers: {
+            'Retry-After': String(windowSeconds),
+            'X-RateLimit-Limit': String(limit),
+            'X-RateLimit-Remaining': '0',
+          }
+        }
+      )
+    }
+
+    return null
+  } catch (error) {
+    console.error('Rate limiting error:', error)
+    // If Redis fails, allow request to proceed (fail open for availability)
+    return null
+  }
+}
+
+/**
+ * Rate limit presets for common operations
+ */
+export const RATE_LIMITS = {
+  // Strict limits for sensitive operations
+  SUPPORT_MESSAGE: { limit: 10, window: 300 },      // 10 messages per 5 minutes
+  ANNOUNCEMENT_SAVE: { limit: 10, window: 300 },    // 10 announcement saves per 5 minutes
+  TICKET_RESOLVE: { limit: 20, window: 300 },       // 20 resolutions per 5 minutes
+  GYM_BAN: { limit: 5, window: 600 },               // 5 bans per 10 minutes
+  
+  // Moderate limits for read operations
+  GYM_LIST: { limit: 100, window: 60 },             // 100 requests per minute
+  TICKET_LIST: { limit: 100, window: 60 },          // 100 requests per minute
+  
+  // Support inbox
+  EMAIL_SEND: { limit: 20, window: 300 },           // 20 replies per 5 minutes
+  EMAIL_READ: { limit: 200, window: 60 },           // 200 reads per minute
+  EMAIL_DRAFT: { limit: 10, window: 300 },          // 10 AI drafts per 5 minutes
+  TICKET_DRAFT: { limit: 10, window: 300 },         // 10 AI ticket-reply drafts per 5 minutes
+
+  // Lenient limits for lightweight operations
+  TICKET_COUNT: { limit: 300, window: 60 },         // 300 requests per minute
+} as const

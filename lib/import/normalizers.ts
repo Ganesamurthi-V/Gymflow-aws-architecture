@@ -1,0 +1,190 @@
+/**
+ * lib/import/normalizers.ts
+ * Single source of truth for all field normalization used in both
+ * auto-import and manual-mapping import flows.
+ */
+
+import { recognizePlanDuration } from "./plan-matching";
+
+export function excelSerialToDate(serial: number): string {
+  const d = new Date(Math.floor(serial - 25569) * 86400 * 1000);
+  // A huge or non-finite number in a date column makes an Invalid Date, and
+  // date-fns format() throws on it, which aborted the whole file read.
+  // UTC getters: the serial is a calendar day, so the viewer's time zone must not move it.
+  return isNaN(d.getTime()) ? "" : utcDay(d);
+}
+
+function utcDay(d: Date): string {
+  return `${String(d.getUTCFullYear()).padStart(4, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
+/** Longest text kept from one spreadsheet cell; a cell can hold 32,767 characters. */
+const MAX_CELL_CHARS = 500;
+
+export function cellStr(value: unknown): string {
+  return cellText(value).slice(0, MAX_CELL_CHARS);
+}
+
+// Only plain values are read. A formula contributes its cached result (never the
+// formula text), a hyperlink its visible text (never the URL), rich text its text.
+function cellText(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number") return String(value);
+  if (typeof value === "boolean") return String(value);
+  // ExcelJS hands back a date cell as that calendar day at 00:00 UTC; local getters would
+  // read the previous day in a browser west of UTC.
+  if (value instanceof Date) return isNaN(value.getTime()) ? "" : utcDay(value);
+  if (typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    if (Array.isArray(o.richText))
+      return (o.richText as { text?: unknown }[]).map(r => (typeof r?.text === "string" ? r.text : "")).join("").trim();
+    if ("result" in o) return cellText(o.result);
+    if ("hyperlink" in o) return cellText(o.text);
+    if ("error" in o) return "";
+    return "";
+  }
+  return String(value).trim();
+}
+
+/**
+ * The plan a cell maps to. Falls back to "monthly" when the cell does not state a
+ * duration; callers that need to tell the two apart use isRecognizedPlan.
+ */
+export function normalizePlan(raw: string): string {
+  return recognizePlanDuration(raw) ?? "monthly";
+}
+
+/** False for a cell the owner has to map by hand (a tier name such as "Gold"). */
+export function isRecognizedPlan(raw: string): boolean {
+  if (!raw.trim()) return true; // Empty plan falls back to monthly, no prompt needed
+  return recognizePlanDuration(raw) !== null;
+}
+
+export function normalizeGender(raw: string): string {
+  const v = raw.toLowerCase().trim();
+  if (["m","male","boy","man","gents","gent","mr"].includes(v)) return "male";
+  if (["f","female","girl","woman","ladies","lady","ms","mrs"].includes(v)) return "female";
+  if (["o","other","others","na","n/a","prefer not to say"].includes(v)) return "other";
+  return "";
+}
+
+export function normalizePaymentMode(raw: string): string {
+  const v = raw.toLowerCase().trim().replace(/\s+/g, "");
+  if (["cash","c","hand","inhand","bycash"].includes(v)) return "cash";
+  if (["upi","gpay","googlepay","phonepay","phonepe","paytm","bhim","online","neft","imps","netbanking","transfer","banktransfer","rtgs"].includes(v)) return "upi";
+  if (["card","debit","credit","debitcard","creditcard","swipe","pos","tap"].includes(v)) return "card";
+  return "cash";
+}
+
+const WORD_NUMS: Record<string, number> = {
+  zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,
+  eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,seventeen:17,
+  eighteen:18,nineteen:19,twenty:20,thirty:30,forty:40,fifty:50,
+  sixty:60,seventy:70,eighty:80,ninety:90,
+};
+
+export function normalizeAge(raw: string): string {
+  if (!raw) return "";
+  const cleaned = raw.toLowerCase().replace(/\s*(years?|yrs?|y)\b/g, "").trim();
+  const num = parseInt(cleaned);
+  if (!isNaN(num) && num > 0 && num <= 120) return String(num);
+  const words = cleaned.replace(/-/g, " ").split(/\s+/);
+  let total = 0;
+  for (const w of words) {
+    const n = WORD_NUMS[w];
+    if (n === undefined) return "";
+    total += n;
+  }
+  return total > 0 && total <= 120 ? String(total) : "";
+}
+
+/**
+ * Normalize a date-of-birth cell to "YYYY-MM-DD", or "" when absent/unparseable.
+ * It never defaults to today (a bogus DOB would fire a
+ * wrong-day birthday message). Only month+day matter for the birthday_wishes
+ * automation, so an ambiguous 2-digit year is harmless.
+ */
+export function normalizeDob(raw: string): string {
+  const t = (raw ?? "").trim();
+  if (!t) return "";
+  const isoMatch = t.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoMatch) return isoMatch[1];
+  const n = Number(t);
+  if (!isNaN(n) && n > 0 && !t.includes("-") && !t.includes("/")) return excelSerialToDate(n);
+  if (t.includes("/") || t.includes("-")) {
+    const parts = t.split(/[/-]/);
+    if (parts.length === 3) {
+      const [a, b, c] = parts;
+      if (a.length === 4) return `${a}-${b.padStart(2, "0")}-${c.padStart(2, "0")}`; // YYYY-MM-DD
+      const year = c.length === 4 ? c : (Number(c) > 30 ? "19" + c : "20" + c);        // DD/MM/YY(YY)
+      return `${year}-${b.padStart(2, "0")}-${a.padStart(2, "0")}`;
+    }
+  }
+  return "";
+}
+
+/**
+ * Normalizes a member number from the import file.
+ *
+ * GF-prefixed IDs (e.g. "GF0042", "gf42", "GF-001") are treated as native
+ * GymFlow IDs — the numeric part is extracted and checked against the DB.
+ *
+ * Everything else (e.g. "C1002", "MEM007", "GYM-42", "#123", plain "1002")
+ * is treated as a LEGACY ID from another system. We store the raw value in
+ * `legacy_member_id` and return `number: ""` so the pipeline auto-assigns a
+ * fresh GymFlow ID — preventing any collision with existing members.
+ *
+ * Returns:
+ *   number   — numeric string to use as member_number, or "" to auto-assign
+ *   prefix   — detected prefix (informational only)
+ *   original — raw trimmed value for legacy_member_id storage
+ */
+export function normalizeMemberNumber(raw: string): {
+  number: string;
+  prefix: string;
+  original: string;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { number: "", prefix: "", original: "" };
+
+  // GF-prefixed → native GymFlow ID, extract the number
+  const gfMatch = trimmed.match(/^[Gg][Ff][-_\s]?(\d+)/);
+  if (gfMatch) {
+    const number = String(parseInt(gfMatch[1], 10));
+    return { number, prefix: "GF", original: trimmed };
+  }
+
+  // Anything else (C1002, MEM007, GYM-42, plain 1002, #123, etc.)
+  // → treat as legacy ID from another system, always auto-assign a new GF ID
+  return { number: "", prefix: "", original: trimmed };
+}
+
+/** Sentinel stored in members.phone when an imported number can't be validated. */
+export const INVALID_PHONE = "INVALID_NUMBER";
+
+/**
+ * Normalize an imported phone number to E.164 (Indian) form for storage.
+ *
+ * Valid input is a 10-digit Indian mobile, optionally already carrying a
+ * country code or a leading 0:
+ *   9876543210      → { phone: "919876543210", valid: true }
+ *   09876543210     → { phone: "919876543210", valid: true }
+ *   +91 98765 43210 → { phone: "919876543210", valid: true }
+ *
+ * Anything that doesn't reduce to exactly 10 significant digits is marked
+ * invalid and stored as the INVALID_PHONE sentinel, which the automation
+ * scheduler and sendTemplate both refuse to send to (they require ≥10 digits).
+ */
+export function normalizePhoneForImport(raw: unknown): { phone: string; valid: boolean } {
+  const digits = String(raw ?? "").replace(/\D/g, "");
+
+  let core = "";
+  if (digits.length === 10) core = digits;
+  else if (digits.length === 11 && digits.startsWith("0")) core = digits.slice(1);
+  else if (digits.length === 12 && digits.startsWith("91")) core = digits.slice(2);
+  else if (digits.length === 13 && digits.startsWith("091")) core = digits.slice(3);
+
+  if (core.length === 10) return { phone: `91${core}`, valid: true };
+  return { phone: INVALID_PHONE, valid: false };
+}

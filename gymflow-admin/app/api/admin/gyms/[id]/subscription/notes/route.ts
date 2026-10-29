@@ -1,0 +1,103 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { verifyRequestAuth } from '@/lib/auth'
+import { createAdminClient } from '@/lib/supabase-admin'
+import { ADMIN_ACTOR, sanitizeUUID } from '@/lib/sanitize'
+import { z } from 'zod'
+
+export const dynamic = 'force-dynamic'
+
+/**
+ * POST /api/admin/gyms/[id]/subscription/notes
+ * Body: {
+ *   admin_notes?: string,
+ *   is_vip?: boolean,
+ *   is_payment_verified?: boolean,
+ *   whatsapp_enabled?: boolean,
+ *   priority_support?: boolean,
+ *   auto_renewal_eligible?: boolean,
+ *   lifetime_offer?: boolean,
+ *   performed_by?: string,
+ * }
+ */
+export async function POST(req: NextRequest, props: { params: Promise<{ id: string }> }) {
+  if (!(await verifyRequestAuth(req))) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+  try {
+    const id = sanitizeUUID((await props.params).id)
+    if (!id) return NextResponse.json({ error: 'Invalid gym id' }, { status: 400 })
+    const flags = z.object({
+      admin_notes: z.string().max(5_000).optional(),
+      is_vip: z.boolean().optional(),
+      is_payment_verified: z.boolean().optional(),
+      whatsapp_enabled: z.boolean().optional(),
+      priority_support: z.boolean().optional(),
+      auto_renewal_eligible: z.boolean().optional(),
+      lifetime_offer: z.boolean().optional(),
+    }).safeParse(await req.json().catch(() => null))
+    if (!flags.success) return NextResponse.json({ error: 'Invalid input' }, { status: 400 })
+    const body = flags.data
+    const {
+      admin_notes,
+      is_vip,
+      is_payment_verified,
+      whatsapp_enabled,
+      priority_support,
+      auto_renewal_eligible,
+      lifetime_offer,
+    } = body
+    const performed_by = ADMIN_ACTOR
+
+    const supabase = createAdminClient()
+    const updates: Record<string, any> = {}
+
+    if (is_vip !== undefined) updates.is_vip = is_vip
+    if (is_payment_verified !== undefined) updates.is_payment_verified = is_payment_verified
+    if (whatsapp_enabled !== undefined) updates.whatsapp_enabled = whatsapp_enabled
+    if (priority_support !== undefined) updates.priority_support = priority_support
+    if (auto_renewal_eligible !== undefined) updates.auto_renewal_eligible = auto_renewal_eligible
+    if (lifetime_offer !== undefined) updates.lifetime_offer = lifetime_offer
+
+    if (Object.keys(updates).length === 0 && admin_notes === undefined) {
+      return NextResponse.json({ error: 'No fields to update' }, { status: 400 })
+    }
+
+    if (Object.keys(updates).length > 0) {
+      const { error } = await supabase.from('gyms').update(updates).eq('id', id)
+      if (error) throw error
+    }
+
+    // Notes live in a service-role-only table: gyms rows stream live to the owner.
+    if (admin_notes !== undefined) {
+      const { error: notesErr } = await supabase
+        .from('gym_admin_notes')
+        .upsert({ gym_id: id, notes: admin_notes, updated_at: new Date().toISOString() }, { onConflict: 'gym_id' })
+      if (notesErr) throw notesErr
+    }
+
+    // Log note changes only when notes are included
+    if (admin_notes !== undefined) {
+      await supabase.rpc('log_subscription_action', {
+        p_gym_id: id,
+        p_action: 'Admin Notes Updated',
+        p_performed_by: performed_by,
+        p_notes: admin_notes?.substring(0, 200) || '(cleared)',
+      })
+    }
+
+    const flagsChanged = Object.keys(updates)
+    if (flagsChanged.length > 0) {
+      await supabase.rpc('log_subscription_action', {
+        p_gym_id: id,
+        p_action: 'Internal Flags Updated',
+        p_performed_by: performed_by,
+        p_notes: flagsChanged.map(f => `${f}: ${updates[f]}`).join(', '),
+      })
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (err: any) {
+    console.error('[SubNotes]', err)
+    return NextResponse.json({ error: 'Request failed' }, { status: 500 })
+  }
+}

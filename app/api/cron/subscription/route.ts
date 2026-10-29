@@ -1,0 +1,89 @@
+/**
+ * POST /api/cron/subscription
+ *
+ * Daily cron: marks gyms whose trial or paid subscription has lapsed as
+ * `subscription_status = 'expired'`.
+ *
+ * No cache invalidation is needed — subscription fields are no longer cached.
+ * getGymSubscription() always fetches a fresh row from Postgres, so the DB
+ * write here is immediately visible on the next page render.
+ *
+ * Security: x-cron-secret header or Bearer token (same as /api/cron/whatsapp).
+ * Vercel Cron triggers this via the schedule in vercel.json.
+ */
+
+import { NextRequest, NextResponse } from 'next/server'
+import { createAdminClient } from '@/lib/supabase/admin'
+import { timingSafeSecretEqual } from '@/lib/monitoring/health'
+import { pingHeartbeat } from '@/lib/monitoring/heartbeat'
+import { reportAlert } from '@/lib/monitoring/alert'
+import { markCronOk } from '@/lib/monitoring/cronStatus'
+
+export const dynamic = 'force-dynamic'
+export const maxDuration = 30
+
+export async function POST(req: NextRequest) {
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  const cronSecret = process.env.CRON_SECRET
+  const authHeader = req.headers.get('authorization') ?? ''
+  const cronHeader = req.headers.get('x-cron-secret') ?? ''
+  const bearer     = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+
+  if (!cronSecret) {
+    // Still answers 401 as before; the alert is what tells the owner the job is being rejected.
+    await reportAlert({ key: 'cron:secret_missing', severity: 'critical', title: 'CRON_SECRET is not set',
+      body: 'Scheduled jobs are being rejected because CRON_SECRET is missing on the server.' })
+  }
+  if (!cronSecret || (!timingSafeSecretEqual(bearer, cronSecret) && !timingSafeSecretEqual(cronHeader, cronSecret))) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const supabase = createAdminClient()
+  const now = new Date().toISOString()
+
+  // ── 1. Expire lapsed trials ───────────────────────────────────────────────
+  const { data: expiredTrials, error: trialsError } = await supabase
+    .from('gyms')
+    .update({ subscription_status: 'expired' })
+    .eq('subscription_status', 'trial')
+    .lt('trial_ends_at', now)
+    .select('id')
+
+  if (trialsError) {
+    console.error('[Cron/Sub] Failed to expire trials:', trialsError)
+    await reportAlert({ key: 'cron:subscription:failed', severity: 'critical', title: 'Subscription cron failed',
+      body: `Failed to expire trials: ${trialsError.message}` })
+    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
+  }
+
+  // ── 2. Expire lapsed paid subscriptions ───────────────────────────────────
+  // Lifetime plans store subscription_ends_at = NULL so .lt() never matches them.
+  const { data: expiredSubs, error: subsError } = await supabase
+    .from('gyms')
+    .update({ subscription_status: 'expired' })
+    .eq('subscription_status', 'active')
+    .lt('subscription_ends_at', now)
+    .select('id')
+
+  if (subsError) {
+    console.error('[Cron/Sub] Failed to expire subscriptions:', subsError)
+    await reportAlert({ key: 'cron:subscription:failed', severity: 'critical', title: 'Subscription cron failed',
+      body: `Failed to expire subscriptions: ${subsError.message}` })
+    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
+  }
+
+  const trials = expiredTrials?.length ?? 0
+  const subs   = expiredSubs?.length ?? 0
+  console.log(`[Cron/Sub] Expired ${trials} trial(s), ${subs} subscription(s).`)
+
+  // Only after both updates succeeded, so a missed ping means the cron failed or never ran.
+  await pingHeartbeat(process.env.BETTERSTACK_HEARTBEAT_SUBSCRIPTION)
+  await markCronOk('subscription')
+
+  return NextResponse.json({ expired: trials + subs, trials, subscriptions: subs })
+}
+
+// Allow GET for Vercel's cron ping
+export async function GET(req: NextRequest) {
+  return POST(req)
+}
