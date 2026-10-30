@@ -46,6 +46,14 @@ export default $config({
       path: '..',
       // The default OpenNext release rejects Next 15.5.28. 4.x is the first release that accepts it.
       openNextVersion: '4.1.13',
+      // One distribution serves every host the middleware routes by hostname. The certificate was
+      // requested by hand in us-east-1 (CloudFront needs it there), and DNS stays outside AWS until cutover.
+      domain: {
+        name: 'app.gymflow.sbs',
+        aliases: ['gymflow.sbs', 'graph.gymflow.sbs', 'member.gymflow.sbs'],
+        cert: 'arn:aws:acm:us-east-1:296214943025:certificate/2b7e1129-ecab-4808-ab28-f1b4bd57e887',
+        dns: false,
+      },
       environment,
       // SST also applies this timeout as the CloudFront origin read timeout, so no transform is needed.
       server: { timeout: '60 seconds', memory: '1024 MB', architecture: 'x86_64' },
