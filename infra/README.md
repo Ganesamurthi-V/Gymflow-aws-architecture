@@ -53,3 +53,27 @@ CloudFront only accepts ACM certificates from us-east-1, whatever the app region
 5. Only then set `enabled: true` on the crons in `sst.config.ts` and redeploy. Never run both: the daily WhatsApp
    automation would run twice.
 6. Rollback: repoint DNS to Vercel, set the cron `enabled` back to false, restore `vercel.json` crons.
+
+## Admin panel (separate SST app)
+
+`gymflow-admin/` deploys as its own SST app (`infra/sst.admin.config.ts`, app name `gymflow-admin`), so main-app
+deploys never depend on admin secrets or its certificate. Every command runs from `infra/` with
+`--config sst.admin.config.ts`. Vercel stays live as the rollback.
+
+1. Certificate: request an ACM certificate for `admin.gymflow.sbs` in us-east-1 (CloudFront requires it). An earlier
+   request failed with CAA_ERROR: Cloudflare can add CAA records for proxied hosts, so set the admin DNS record to
+   DNS only, or add a CAA record allowing `amazon.com`, before requesting. Validate with the CNAME ACM shows.
+2. In `gymflow-admin/` run `npx vercel env pull .env.local`.
+3. In `infra/` run `bash set-admin-secrets.sh` (prints only `set:` / `MISSING:`).
+4. Export `ADMIN_CERT_ARN` and the plain vars listed in `PLAIN_ENV_NAMES` (empty values are skipped).
+5. `npx sst diff --stage production --config sst.admin.config.ts`, then `npx sst deploy ...` (or run the
+   aws-deploy workflow with target `admin`, which reads repository variables).
+6. Cutover: CNAME `admin` to the CloudFront domain printed by deploy, DNS only. Lower the TTL first.
+
+Verify after cutover:
+
+- Admin login at `/auth`.
+- Resend inbound webhook URL is unchanged and still delivers.
+- The Postgres trigger that calls `/api/push/dispatch` still reaches the new host.
+- Rate limiting by client IP: `lib/rate-limit.ts` `getClientIp` prefers `x-real-ip`, which Vercel sets but
+  CloudFront does not. Check which header it falls back to, or all users may share one bucket.
