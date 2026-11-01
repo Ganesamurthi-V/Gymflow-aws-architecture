@@ -1,6 +1,6 @@
 import { HeroVideo } from './HeroVideo';
 import { DashboardMock } from './dashboard/DashboardMock';
-import { Magnet, SpotlightSurface, TiltFrame } from './fx';
+import { Magnet } from './fx';
 import { HeroBackdrop } from './ascii/HeroBackdrop';
 import { FREE_MEMBER_LIMIT } from '../data/plans';
 import '../styles/hero.css';
@@ -16,12 +16,8 @@ const APP_URL = 'https://app.gymflow.sbs';
 export function Hero() {
   return (
     <>
-      <section aria-labelledby="hero-title" className="hero-stage band-ink relative overflow-clip px-5 md:px-8">
-        {/* The backdrop wraps only the headline block, so it stops at the trial line and not at the product frame. */}
-        <div className="relative">
-          <div aria-hidden className="hero-field pointer-events-none absolute"><HeroBackdrop /></div>
-
-          <div className="mx-auto w-full max-w-[1200px]">
+      <section aria-labelledby="hero-title" className="hero-stage relative overflow-clip px-5 md:px-8">
+        <div className="mx-auto w-full max-w-[1200px]">
           <h1 id="hero-title" className="display-xxl hero-h1">
             Gym management software made effortless
           </h1>
@@ -30,7 +26,7 @@ export function Hero() {
 
           <div className="hero-actions">
             <Magnet strength={0.12} className="sm:w-auto">
-              <a href={APP_URL} className="btn btn-primary btn-lg w-full sm:w-auto">
+              <a href={APP_URL} className="btn btn-primary btn-lg">
                 Start free trial
               </a>
             </Magnet>
@@ -44,29 +40,29 @@ export function Hero() {
             <span>No credit card</span>
             <span>Free for up to {FREE_MEMBER_LIMIT} members</span>
           </p>
-          </div>
-        </div>
 
-        <div className="mx-auto w-full max-w-[1200px]">
           <div className="hero-demo">
+            <div aria-hidden className="hero-field pointer-events-none absolute"><HeroBackdrop /></div>
             <div className="hero-float">
-              <TiltFrame max={1.5}>
-                <SpotlightSurface className="hero-dash">
-                  <p className="sr-only">
-                    Sample data. The GymFlow owner console: active, expiring and expired members, today&apos;s collection and total
-                    dues, with a sidebar for members, payments, dues, attendance, inventory and programs.
-                  </p>
-                  <DashboardMock />
-                </SpotlightSurface>
-              </TiltFrame>
+              {/* A plain frame: no tilt and no cursor spotlight, the mock stays still on hover. */}
+              <div className="hero-dash">
+                <p className="sr-only">
+                  Sample data. The GymFlow owner console: active, expiring and expired members, today&apos;s collection and total
+                  dues, with a sidebar for members, payments, dues, attendance, inventory and programs.
+                </p>
+                <DashboardMock />
+              </div>
             </div>
             <p className="hero-foot text-[14px]">Sample data. Click around the sidebar to try it.</p>
           </div>
         </div>
       </section>
 
-      <section aria-label="Product film" className="bg-subtle px-5 py-24 md:px-8 md:py-32">
+      <section aria-labelledby="film-title" className="bg-subtle px-5 py-24 md:px-8 md:py-32">
         <div className="mx-auto max-w-[1200px]">
+          <h2 id="film-title" className="display-2 mx-auto mb-10 min-w-0 max-w-[20ch] text-balance text-center md:mb-14">
+            See GymFlow in one minute
+          </h2>
           <HeroVideo />
         </div>
       </section>

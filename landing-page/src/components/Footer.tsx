@@ -7,8 +7,6 @@ import {
   WHATSAPP_URL,
 } from '../data/support';
 import { homeAnchor } from '../lib/pageAnchors';
-import { Rise } from './fx';
-import { AsciiLogo } from './ascii';
 import '../styles/footer.css';
 
 const APP_URL = 'https://app.gymflow.sbs';
@@ -80,18 +78,8 @@ export function Footer({ reveal = false }: { reveal?: boolean }) {
         id="support"
         className={`border-t border-border-subtle bg-background px-6 pt-20 pb-8 md:px-12 md:pt-28${reveal ? ` ${REVEAL_PANEL}` : ''}`}
       >
-        {/* The wordmark: the ASCII logo decodes on view and ripples under the cursor. */}
-        <div className="mx-auto max-w-[1240px]">
-          <a href={homeAnchor('#')} aria-label="GymFlow home" className="block w-[min(100%,960px)]">
-            <AsciiLogo cols={120} />
-          </a>
-          <Rise as="p" className="mt-6 max-w-[40ch] font-display text-[22px] font-medium leading-snug text-foreground md:text-[24px]">
-            Gym management software for independent gyms in India.
-          </Rise>
-        </div>
-
         {/* Link columns, one quiet ruled row. */}
-        <div className="mx-auto mt-16 grid max-w-[1240px] gap-12 border-t border-border-subtle pt-10 md:grid-cols-[1fr_1fr_1.4fr]">
+        <div className="mx-auto grid max-w-[1240px] gap-12 border-t border-border-subtle pt-10 md:grid-cols-[1fr_1fr_1.4fr]">
           {COLUMNS.map(column => (
             <nav key={column.heading} aria-label={column.heading}>
               <h3 className="text-base font-semibold text-foreground">{column.heading}</h3>
@@ -170,6 +158,17 @@ export function Footer({ reveal = false }: { reveal?: boolean }) {
             <p className="mt-4 text-base text-muted-foreground">
               Direct founder support on WhatsApp, phone and email. Support in English and Tamil.
             </p>
+            <a href={homeAnchor('#')} aria-label="GymFlow home" className="mt-8 inline-block">
+              {/* Same wordmark as the header: dark ink, lifted to white in night mode. */}
+              <img
+                src="/logo_landspace_without_bg.webp"
+                alt="GymFlow"
+                width={400}
+                height={178}
+                loading="lazy"
+                className="h-16 w-auto md:h-20 dark:brightness-0 dark:invert"
+              />
+            </a>
           </div>
         </div>
 

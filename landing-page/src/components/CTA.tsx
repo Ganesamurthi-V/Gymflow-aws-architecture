@@ -1,6 +1,5 @@
 import { Check } from 'lucide-react';
 import { SUPPORT_PROMISE } from '../data/support';
-import { AsciiLogo } from './ascii';
 import { Magnet, Rise } from './fx';
 import '../styles/close.css';
 
@@ -14,8 +13,7 @@ const TRUST_CHIPS = [
 
 /**
  * Closing call to action: the one blue band on the page, white ink, centred. The primary key is white
- * with blue ink (the band-accent rules in index.css), magnetic toward a fine pointer. The ASCII logo
- * sits below the actions as a quiet texture (close.css turns the canvas white).
+ * with blue ink (the band-accent rules in index.css), magnetic toward a fine pointer.
  */
 export function CTA() {
   return (
@@ -51,10 +49,6 @@ export function CTA() {
             </li>
           ))}
         </ul>
-
-        <div className="close-ascii mt-20 w-full max-w-[960px]">
-          <AsciiLogo cols={120} />
-        </div>
       </div>
     </section>
   );

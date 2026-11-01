@@ -26,8 +26,7 @@ dist/
 *.generated.py
 graphify-out/
 graphify-out
-youpi-pg/
-youpi-pg
+Saas.mp4
 
 # Removing the block that ignores everything except src/ since this project uses app/ structure
 # Sentry Config File

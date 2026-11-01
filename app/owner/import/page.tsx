@@ -19,8 +19,8 @@ import {
 import { runImportPipeline } from "@/lib/import/pipeline";
 import { checkImportFile, declaredUncompressedSize, MAX_SHEET_ROWS, MAX_SHEET_COLUMNS, MAX_XLSX_UNCOMPRESSED_BYTES } from "@/lib/import/schema";
 import { groupPlanNames, recognizePlanMonths, type PlanNameGroup } from "@/lib/import/plan-matching";
-import { monthsForPlan, parseStartDate, planForMonths } from "@/lib/import/membershipDates";
-import { findGymPlan, gymChoiceValue, GYM_PREFIX, nearestStandard, suggestGymPlan, type GymPlanChoice } from "@/lib/import/gymPlans";
+import { detectDateOrder, monthsForPlan, parseStartDate, planForMonths, type DateOrder } from "@/lib/import/membershipDates";
+import { gymChoiceValue, gymPlanFromChoice, gymPlanLabel, nearestStandard, suggestGymPlan, type GymPlanChoice } from "@/lib/import/gymPlans";
 import { todayIST } from "@/lib/utils";
 import { ArrowRight } from "lucide-react";
 import WizardHeader from "@/components/import/WizardHeader";
@@ -470,6 +470,8 @@ export default function ImportPage() {
   const [planMapping, setPlanMapping] = useState<Record<string, string>>({});
   // The gym's saved plans (Plans page). Empty = the built-in monthly / quarterly / annual choices only.
   const [gymPlans, setGymPlans] = useState<GymPlanChoice[]>([]);
+  // Why the saved plans could not be read, so an empty list is never mistaken for "no plans saved".
+  const [plansError, setPlansError] = useState<string | null>(null);
   const [tempImportState, setTempImportState] = useState<{
     parsedRows: ImportedRow[];
     detectedColumns: Record<string, string>;
@@ -561,6 +563,32 @@ export default function ImportPage() {
       } catch {}
     }
 
+    // The plan list kept in the session was read when the file was uploaded. Plans added or changed
+    // since (the "Add your plans" link opens the Plans page) must show up on coming back, so re-read them.
+    if (storedUnmapped) {
+      (async () => {
+        try {
+          const res = await api.get<{ data?: { plans?: GymPlanChoice[] } }>("/api/import/gym-plans");
+          const fresh = res?.data?.plans;
+          if (!fresh) return;
+          const before: GymPlanChoice[] = JSON.parse(sessionStorage.getItem("import_gym_plans") ?? "[]");
+          if (JSON.stringify(before) === JSON.stringify(fresh)) return;
+          setGymPlans(fresh);
+          sessionStorage.setItem("import_gym_plans", JSON.stringify(fresh));
+          // Choices made against the old list may name a plan that is gone; start from fresh suggestions.
+          const groups: { variants: { raw: string }[] }[] = JSON.parse(storedUnmapped);
+          const remapped: Record<string, string> = {};
+          groups.forEach(g => g.variants.forEach(v => {
+            const hit = suggestGymPlan(v.raw, fresh);
+            remapped[v.raw] = hit ? gymChoiceValue(hit) : (nearestStandard(v.raw) ?? "");
+          }));
+          setPlanMapping(remapped);
+          sessionStorage.setItem("import_plan_mapping", JSON.stringify(remapped));
+          setPlansError(null);
+        } catch (e) { setPlansError(e instanceof Error ? e.message : "Could not load your plans"); }
+      })();
+    }
+
     const storedTempState = sessionStorage.getItem("import_temp_state");
     if (storedTempState) {
       try {
@@ -621,7 +649,7 @@ export default function ImportPage() {
     const mappedRows = currentState.parsedRows.map(r => {
       const choice = r._rawPlan ? planMapping[r._rawPlan] : undefined;
       if (r._rawPlan && choice) {
-        const gp = choice.startsWith(GYM_PREFIX) ? findGymPlan(gymPlans, choice.slice(GYM_PREFIX.length)) : undefined;
+        const gp = gymPlanFromChoice(gymPlans, choice);
         if (gp) {
           // The chosen plan decides label, category and exact length; the server re-checks all three.
           const label = planForMonths(gp.months);
@@ -815,9 +843,19 @@ export default function ImportPage() {
     try {
       const res = await api.get<{ data?: { plans?: GymPlanChoice[] } }>("/api/import/gym-plans");
       ownPlans = res?.data?.plans ?? [];
-    } catch { /* no saved plans -> built-in labels, exactly as before */ }
+      setPlansError(null);
+    } catch (e) { setPlansError(e instanceof Error ? e.message : "Could not load your plans"); /* built-in labels still work */ }
     const today = todayIST();
     const hasStartCol = !!colMap.start_date;
+    // A US-style sheet (02-27-2024) is read month first for the whole column, so 03-04-2024 in it is not misread.
+    let dateOrder: DateOrder = "dmy";
+    if (hasStartCol) {
+      const rawDates: string[] = [];
+      ws.eachRow({ includeEmpty: false }, (row: any, rowIndex: number) => {
+        if (rowIndex > headerRowIndex) rawDates.push(getCol(row, colMap, "start_date"));
+      });
+      dateOrder = detectDateOrder(rawDates);
+    }
     ws.eachRow({ includeEmpty: false }, (row: any, rowIndex: number) => {
       if (rowIndex <= headerRowIndex) return;
       const name = getCol(row, colMap, "name");
@@ -842,7 +880,7 @@ export default function ImportPage() {
 
       // A blank or unreadable start date is never replaced by today: that would hand an
       // existing member a fresh full plan. The row is held back until the owner fixes it.
-      const startResult = hasStartCol ? parseStartDate(rawDate, today) : null;
+      const startResult = hasStartCol ? parseStartDate(rawDate, today, dateOrder) : null;
       const start_date = startResult ? (startResult.ok ? startResult.date : "") : today;
       const statedMonths = rawPlan ? recognizePlanMonths(rawPlan) : null;
       const duration_months = statedMonths !== null && statedMonths !== monthsForPlan(plan) ? statedMonths : undefined;
@@ -888,8 +926,8 @@ export default function ImportPage() {
       Object.keys(unrecognizedCounts).forEach(p => {
         if (ownPlans.length === 0) { initialMapping[p] = "monthly"; return; }
         // Suggestion only. "" stays visibly unresolved until the owner picks.
-        const name = suggestGymPlan(p, ownPlans);
-        initialMapping[p] = name ? gymChoiceValue(name) : (nearestStandard(p) ?? "");
+        const hit = suggestGymPlan(p, ownPlans);
+        initialMapping[p] = hit ? gymChoiceValue(hit) : (nearestStandard(p) ?? "");
       });
       setPlanMapping(initialMapping);
       setGymPlans(ownPlans);
@@ -1247,8 +1285,8 @@ export default function ImportPage() {
                         {gymPlans.length > 0 && (
                           <optgroup label="Your plans">
                             {gymPlans.map(p => (
-                              <option key={p.planName} value={gymChoiceValue(p.planName)}>
-                                {p.planName} · {p.months} {p.months === 1 ? "month" : "months"} · ₹{p.price}
+                              <option key={gymChoiceValue(p)} value={gymChoiceValue(p)}>
+                                {gymPlanLabel(p)} · {p.months} {p.months === 1 ? "month" : "months"} · ₹{p.price}
                               </option>
                             ))}
                           </optgroup>
@@ -1275,7 +1313,7 @@ export default function ImportPage() {
                 </p>
               )}
               <p className="text-xs text-slate-500 text-center">
-                {gymPlans.length > 0 ? "Missing a plan? " : "You have not saved any plans yet. "}
+                {plansError ? `We could not load your saved plans (${plansError}). Reload this page to try again. ` : gymPlans.length > 0 ? "Missing a plan? " : "You have not saved any plans yet. "}
                 <Link href="/owner/plans" className="font-bold text-brand-600 hover:text-brand-700">
                   {gymPlans.length > 0 ? "Manage your plans" : "Add your plans"}
                 </Link>

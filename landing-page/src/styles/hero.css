@@ -6,8 +6,28 @@
   isolation: isolate;
   padding-top: 112px;
   padding-bottom: var(--space-2xl);
-  /* a graphite stage: the GradientASCII glow reads against it, and .band-ink remaps the text and keycap tokens for everything inside */
+  /* light theme: the page's own white; the blue glow fades into it */
+  background: var(--background);
+}
+/* dark theme: the graphite stage, with the same token remap .band-ink applies (kept in step with it in index.css) */
+.dark .hero-stage {
   background: var(--band-ink);
+  color: var(--band-ink-fg);
+  --foreground: var(--band-ink-fg);
+  --muted-foreground: var(--band-ink-muted);
+  --border: var(--band-ink-line);
+  --border-strong: var(--band-ink-line-strong);
+  --frame: var(--band-ink-surface);
+  --muted: var(--band-ink-surface);
+  --subtle: var(--band-ink-surface);
+  --accent-text: var(--band-ink-accent);
+  --ring: var(--band-ink-accent);
+  --key-face: var(--band-ink-surface);
+  --key-edge: var(--band-ink-edge);
+  --key-drop: var(--band-ink-edge);
+  --key-hi: var(--band-ink-line);
+  --shadow-card: 0 0 0 1px var(--band-ink-line), 0 12px 32px -16px var(--band-ink-edge);
+  --shadow-lift: 0 0 0 1px var(--band-ink-line-strong), 0 24px 48px -20px var(--band-ink-edge);
 }
 @media (min-width: 768px) {
   .hero-stage {
@@ -16,23 +36,18 @@
 }
 
 /* The GradientASCII backdrop sits behind everything; its dark areas are transparent, so it dissolves into the page below the frame. */
-/* Positioned against the headline wrapper, so it runs from the top of the stage (the section's padding,
-   which the section's px-5 / md:px-8 gutters cancel out) down to the trial line, and not over the product. */
+/* Spans the whole stage, from the top edge down past the product frame, so the glow shows in the margins beside
+   the whole frame. It rises from the bottom of this box and dissolves on its own before the top (HeroBackdrop
+   `reach`), so the top has no cut line; the last 12rem is masked out so the bottom fades too. */
 .hero-field {
   position: absolute;
-  top: -112px;
-  bottom: 0;
-  left: -1.25rem;
-  right: -1.25rem;
+  top: -5rem;
+  bottom: calc(-1 * var(--space-2xl));
+  inset-inline: calc(50% - 50vw);
   z-index: -1;
   pointer-events: none;
-}
-@media (min-width: 768px) {
-  .hero-field {
-    top: -136px;
-    left: -2rem;
-    right: -2rem;
-  }
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 8rem, #000 calc(100% - 12rem), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 8rem, #000 calc(100% - 12rem), transparent 100%);
 }
 
 /* Two balanced lines on a wide screen, three on a phone (about 44px there). */
@@ -76,6 +91,29 @@
     align-items: center;
   }
 }
+/* Phones: two compact centred buttons, Start free trial above See pricing, and no dashboard mock
+   (it is too small to read at this width; the film below shows the product). */
+@media (max-width: 639px) {
+  .hero-actions {
+    align-items: center;
+    gap: var(--space-sm);
+  }
+  .hero-actions .btn-lg {
+    min-height: 44px;
+    padding: 0 24px;
+    font-size: 16px;
+  }
+  .hero-actions .btn-outline {
+    min-height: 40px;
+    padding: 0 20px;
+    font-size: 15px;
+  }
+}
+@media (max-width: 767px) {
+  .hero-demo {
+    display: none;
+  }
+}
 /* One quiet line, three short phrases separated by space only. */
 .hero-terms {
   display: flex;
@@ -92,8 +130,11 @@
 /* ── The product: the member list on a 20px-radius frame. ── */
 .hero-demo {
   position: relative;
-  max-width: 1040px;
-  margin: var(--space-3xl) auto 0;
+  /* wider than the 1200px text column, since the product is the point of the page; the left margin centres it
+     (50% is half the column), and it never exceeds the viewport minus the gutters. */
+  width: min(1180px, calc(100vw - 3rem));
+  max-width: none;
+  margin: var(--space-3xl) 0 0 calc(50% - min(590px, 50vw - 1.5rem));
   min-width: 0;
 }
 @media (max-width: 767px) {
@@ -105,7 +146,7 @@
 .hero-dash {
   overflow: clip;
   border-radius: 20px;
-  border: 1px solid var(--band-ink-line-strong);
+  border: 1px solid var(--border-strong);
   box-shadow: var(--shadow-lift);
   background: var(--dash-page);
 }
@@ -191,7 +232,10 @@
   display: inline-block;
   padding: var(--space-2xs) var(--space-sm);
   border-radius: 8px;
-  /* a dark chip: the line sits on the brightest part of the ASCII glow, where plain text washes out */
+  /* a quiet chip: the line sits on the brightest part of the ASCII glow, where plain text washes out */
+  background: var(--background);
+}
+.dark .hero-foot {
   background: var(--band-ink);
 }
 

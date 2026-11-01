@@ -74,7 +74,7 @@ const FREE_CARD: Card = {
   name: 'Free forever',
   tagline: 'Everything you need to get started',
   price: 0,
-  unit: '/ month',
+  unit: '/ forever',
   cta: 'Get Free',
   features: [
     `Up to ${FREE_MEMBER_LIMIT} members`,
@@ -130,7 +130,7 @@ export function Pricing() {
   return (
     <Section id="pricing" labelledBy="pricing-title" tone="paper">
       <h2 id="pricing-title" className="display-2 mx-auto max-w-[20ch] min-w-0 text-balance text-center [overflow-wrap:break-word]">
-        Simple pricing, free up to 50 members
+        Simple pricing, free forever up to 50 members
       </h2>
 
       <div className="mt-10 flex justify-center">
@@ -225,8 +225,7 @@ export function Pricing() {
       </div>
 
       <p className="mx-auto mt-8 max-w-[1040px] text-base text-muted-foreground">
-        No GST is added. The price you see is the price you pay. The free plan is capped at{' '}
-        {FREE_MEMBER_LIMIT} members.
+        No GST is added. The price you see is the price you pay.
       </p>
     </Section>
   );

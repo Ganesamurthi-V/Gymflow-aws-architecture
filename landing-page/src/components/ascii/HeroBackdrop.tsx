@@ -14,10 +14,14 @@ function readRamp(): Ramp {
   const bright = token('--band-ink-accent');
   const white = token('--band-ink-fg');
   // brand blue at the edge of the glow, a lifted blue, the pale blue of the band's own accent, then its near-white core
-  const colors = [accent, `color-mix(in oklab, ${accent} 50%, ${bright})`, bright, white];
+  const dark = root.classList.contains('dark');
+  // light theme sits on white: the near-white core would vanish, so the ramp stays in the accent blues, deepening toward the core
+  const colors = dark
+    ? [accent, `color-mix(in oklab, ${accent} 50%, ${bright})`, bright, white]
+    : [`color-mix(in oklab, ${accent} 45%, white)`, `color-mix(in oklab, ${accent} 75%, white)`, accent, `color-mix(in oklab, ${accent} 80%, black)`];
   // On a phone the hero is short, so the tall glow would sit behind every line of copy: keep it to the lower part there.
   const phone = window.matchMedia('(max-width: 767px)').matches;
-  return { key: (root.classList.contains('dark') ? 'night' : 'light') + (phone ? '-phone' : ''), colors, font: token('--font-mono') || 'monospace', phone };
+  return { key: (dark ? 'night' : 'light') + (phone ? '-phone' : ''), colors, font: token('--font-mono') || 'monospace', phone };
 }
 
 export function HeroBackdrop({ className }: { className?: string }) {
@@ -47,7 +51,7 @@ export function HeroBackdrop({ className }: { className?: string }) {
       grain={0.05}
       softness={0.8}
       scale={1.2}
-      reach={ramp.phone ? 1.05 : 1.9}
+      reach={ramp.phone ? 1.05 : 2.0}
       flow={0.6}
       speed={0.8}
       clickEffect="wave"

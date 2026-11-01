@@ -14,8 +14,8 @@ const FILMS = {
 } as const;
 
 /**
- * The product film plate: the film in a 20px-radius frame (hairline, layered shadow) with its caption
- * beneath, on the quiet band Hero.tsx puts it in. Its full size is capped two ways: by
+ * The product film plate: the film in a 20px-radius frame (hairline, layered shadow), on the quiet band
+ * Hero.tsx puts it in, under that band's heading. Its full size is capped two ways: by
  * width, and by height (the calc in the className), so the frame ends about where a laptop screen
  * does. The film is 16:9 and is not cropped: its headline sits near the top edge and the phone
  * near the bottom.
@@ -239,9 +239,6 @@ export function HeroVideo() {
       )}
       </div>
       </div>
-      <figcaption className="pt-6 text-center font-display text-xl font-medium text-foreground">
-        See GymFlow in one minute.
-      </figcaption>
     </figure>
   );
 }
