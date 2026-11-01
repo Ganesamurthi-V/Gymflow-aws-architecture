@@ -17,9 +17,11 @@ export function Hero() {
   return (
     <>
       <section aria-labelledby="hero-title" className="hero-stage band-ink relative overflow-clip px-5 md:px-8">
-        <div aria-hidden className="hero-field pointer-events-none absolute inset-x-0 top-0"><HeroBackdrop /></div>
+        {/* The backdrop wraps only the headline block, so it stops at the trial line and not at the product frame. */}
+        <div className="relative">
+          <div aria-hidden className="hero-field pointer-events-none absolute"><HeroBackdrop /></div>
 
-        <div className="mx-auto w-full max-w-[1200px]">
+          <div className="mx-auto w-full max-w-[1200px]">
           <h1 id="hero-title" className="display-xxl hero-h1">
             Gym management software made effortless
           </h1>
@@ -42,7 +44,10 @@ export function Hero() {
             <span>No credit card</span>
             <span>Free for up to {FREE_MEMBER_LIMIT} members</span>
           </p>
+          </div>
+        </div>
 
+        <div className="mx-auto w-full max-w-[1200px]">
           <div className="hero-demo">
             <div className="hero-float">
               <TiltFrame max={1.5}>
