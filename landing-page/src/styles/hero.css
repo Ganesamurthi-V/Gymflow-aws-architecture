@@ -16,13 +16,23 @@
 }
 
 /* The GradientASCII backdrop sits behind everything; its dark areas are transparent, so it dissolves into the page below the frame. */
+/* Positioned against the headline wrapper, so it runs from the top of the stage (the section's padding,
+   which the section's px-5 / md:px-8 gutters cancel out) down to the trial line, and not over the product. */
 .hero-field {
   position: absolute;
-  inset-inline: 0;
-  top: 0;
+  top: -112px;
   bottom: 0;
+  left: -1.25rem;
+  right: -1.25rem;
   z-index: -1;
   pointer-events: none;
+}
+@media (min-width: 768px) {
+  .hero-field {
+    top: -136px;
+    left: -2rem;
+    right: -2rem;
+  }
 }
 
 /* Two balanced lines on a wide screen, three on a phone (about 44px there). */
